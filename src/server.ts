@@ -25,6 +25,21 @@ export function buildServer() {
     },
   });
 
+  app.setErrorHandler((error, request, reply) => {
+    request.log.error(error);
+    const statusCode =
+      error.statusCode && error.statusCode >= 400 && error.statusCode < 600
+        ? error.statusCode
+        : 500;
+    const errorString =
+      statusCode === 404
+        ? 'not_found'
+        : statusCode === 400
+          ? 'invalid_request'
+          : 'internal_server_error';
+    reply.code(statusCode).send({ error: errorString });
+  });
+
   // The browser app runs on a different origin to this API (a different
   // port in development, a different host in deployment), so every call
   // from it is cross-origin and fails as an opaque "Failed to fetch"
