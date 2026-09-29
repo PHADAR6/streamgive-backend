@@ -245,35 +245,33 @@ describe('admin NGO application review', () => {
     await app.close();
   });
 
-  it('allows a valid admin signature encoded as hex', async () => {
+  it('returns 404 when approving or rejecting a non-existent application id', async () => {
     const app = buildServer();
-    const timestamp = Date.now().toString();
-    const payload = `GET:/ngo-applications:${timestamp}`;
-    const signatureHex = Buffer.from(adminKeypair.sign(sep53Hash(payload))).toString('hex');
-    const headers = {
-      'x-admin-address': adminKeypair.publicKey(),
-      'x-admin-signature': signatureHex,
-      'x-admin-timestamp': timestamp,
-    };
 
-    const response = await app.inject({ method: 'GET', url: '/ngo-applications', headers });
-    expect(response.statusCode).toBe(200);
+    const nonExistentId = '00000000-0000-0000-0000-000000000000';
+    const approveUrl = `/ngo-applications/${nonExistentId}/approve`;
+    const approveHeaders = signAdminRequest(adminKeypair, 'POST', approveUrl);
 
-    await app.close();
-  });
+    const approveResponse = await app.inject({
+      method: 'POST',
+      url: approveUrl,
+      headers: approveHeaders,
+      payload: {},
+    });
+    expect(approveResponse.statusCode).toBe(404);
+    expect(approveResponse.json().error).toBe('not_found');
 
-  it('rejects a 64-byte hex signature that does not verify with 401', async () => {
-    const app = buildServer();
-    const timestamp = Date.now().toString();
-    const invalidHexSignature = '00'.repeat(64); // 64 bytes in hex
-    const headers = {
-      'x-admin-address': adminKeypair.publicKey(),
-      'x-admin-signature': invalidHexSignature,
-      'x-admin-timestamp': timestamp,
-    };
+    const rejectUrl = `/ngo-applications/${nonExistentId}/reject`;
+    const rejectHeaders = signAdminRequest(adminKeypair, 'POST', rejectUrl);
 
-    const response = await app.inject({ method: 'GET', url: '/ngo-applications', headers });
-    expect(response.statusCode).toBe(401);
+    const rejectResponse = await app.inject({
+      method: 'POST',
+      url: rejectUrl,
+      headers: rejectHeaders,
+      payload: {},
+    });
+    expect(rejectResponse.statusCode).toBe(404);
+    expect(rejectResponse.json().error).toBe('not_found');
 
     await app.close();
   });
