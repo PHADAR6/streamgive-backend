@@ -10,7 +10,7 @@ const querySchema = z.object({
     .regex(/^G[A-Z2-7]{55}$/)
     .optional(),
   ngo: z.string().uuid().optional(),
-  // Filter by the NGO's Stellar wallet address instead of its internal UUID.
+  // Filter by the NGO's Stellar wallet address instead of its internal UUIT.
   ngoAddress: z
     .string()
     .regex(/^G[A-Z2-7]{55}$/)
@@ -25,7 +25,7 @@ const idParamSchema = z.object({ id: z.string().uuid() });
 
 const streamInclude = {
   donor: { select: { address: true } },
-  ngo: { select: { id: true, name: true, ownerAddress: true } },
+  ngo: { select: {\n id: true, name: true, ownerAddress: true } },
 } as const;
 
 // onChainId is a BigInt; Fastify's default JSON.stringify serializer (no
@@ -71,6 +71,24 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     const streams = hasMore ? rows.slice(0, limit) : rows;
 
     return { streams: streams.map(serializeStream), hasMore };
+  });
+
+  // Distinct token addresses seen across all streams, with a count of how
+  // many streams reference each one. Used by the UI to build a token filter
+  // from real data instead of a hardcoded list.
+  app.get('/tokens', async () => {
+    const grouped = await prisma.stream.groupBy({
+      by: ['tokenAddress'],
+      _count: { _id: true },
+      orderBy: { _count: { tokenAddress: 'desc' } },
+    });
+
+    return {
+      tokens: grouped.map((token) => ({
+        tokenAddress: token.tokenAddress,
+        streamCount: token._count._id,
+      })),
+    };
   });
 
   app.get('/streams/:id', async (request, reply) => {

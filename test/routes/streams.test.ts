@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { prisma } from '../../src/db.js';
-import { buildServer } from '../../src/server.js';
+import { prisma } from '../../src/db.js';import { buildServer } from '../../src/server.js';
 import { fakeAddress, resetDb } from '../helpers/db.js';
 
 describe('GET /streams', () => {
@@ -121,7 +120,7 @@ describe('GET /streams', () => {
     const firstBody = firstPage.json();
     expect(firstBody.streams).toHaveLength(2);
     expect(firstBody.hasMore).toBe(true);
-    expect(firstBody.streams.map((s: { onChainId: string }) => s.onChainId)).toEqual(['3', '2']);
+    expect(firstBody.streams.map((s { onChainId: string }) => s.onChainId)).toEqual(['3', '2']);
 
     const secondPage = await app.inject({
       method: 'GET',
@@ -351,7 +350,7 @@ describe('GET /streams/:id', () => {
     await app.close();
   });
 
-  it('400s for a malformed id instead of leaking a Prisma error', async () => {
+  it('400s on a malformed id instead of leaking a Prisma error', async () => {
     const app = buildServer();
 
     const response = await app.inject({ method: 'GET', url: '/streams/not-a-uuid' });
@@ -388,6 +387,86 @@ describe('GET /streams/:id', () => {
     expect(body.ngo.registered).toBe(false);
     // ownerAddress is still present so clients can display the wallet address if they choose.
     expect(body.ngo.ownerAddress).toBe(ngo.ownerAddress);
+
+    await app.close();
+  });
+});
+
+describe('GET /tokens', () => {
+  afterEach(async () => {
+    await resetDb();
+  });
+
+  it('returns distinct token addresses with a stream count for each', async () => {
+    const app = buildServer();
+
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
+    const ngo = await prisma.ngo.create({
+      data: { ownerAddress: fakeAddress('B'), name: 'NGO', verified: true },
+    });
+
+    const tokenA = fakeAddress('D');
+    const tokenB = fakeAddress('E');
+
+    await prisma.stream.createMany({
+      data: [
+        {
+          onChainId: 1n,
+          donorId: donor.id,
+          ngoId: ngo.id,
+          tokenAddress: tokenA,
+          rate: '1',
+          balance: '100',
+          withdrawn: '0',
+        },
+        {
+          onChainId: 2n,
+          donorId: donor.id,
+          ngoId: ngo.id,
+          tokenAddress: tokenA,
+          rate: '1',
+          balance: '100',
+          withdrawn: '0',
+        },
+        {
+          onChainId: 3n,
+          donorId: donor.id,
+          ngoId: ngo.id,
+          tokenAddress: tokenB,
+          rate: '1',
+          balance: '100',
+          withdrawn: '0',
+        },
+      ],
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/tokens' });
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json();
+    expect(Array.isArray(body.tokens)).toBe(true);
+    expect(body.tokens).toHaveLength(2);
+
+    const byAddress = new Map<string, number>(
+      body.tokens.map((t: { tokenAddress: string; count: number }) => [
+        t.tokenAddress,
+        t.count,
+      ]),
+    );
+    expect(byAddress.get(tokenA)).toBe(2);
+    expect(byAddress.get(tokenB)).toBe(1);
+
+    await app.close();
+  });
+
+  it('returns an empty list when there are no streams', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({ method: 'GET', url: '/tokens' });
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json();
+    expect(body.tokens).toEqual([]);
 
     await app.close();
   });

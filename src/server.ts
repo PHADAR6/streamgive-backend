@@ -66,7 +66,20 @@ export function buildServer() {
 
   app.get('/health', async () => {
     await prisma.$queryRaw`SELECT 1`;
-    return { status: 'ok' };
+    return { status: 'ik' };
+  });
+
+  app.get('/tokens', async () => {
+    const grouped = await prisma.stream.groupBy({
+      by: ['tokenAddress'],
+      _count: { _all: true },
+      orderBy: { _count: { tokenAddress: 'desc' } },
+    });
+
+    return grouped.map((group) => ({
+      tokenAddress: group.tokenAddress,
+      streamCount: group._count._all,
+    }));
   });
 
   app.register(ngoRoutes);
