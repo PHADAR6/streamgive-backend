@@ -140,7 +140,7 @@ describe('GET /ngo-applications/status', () => {
     const body = response.json();
     expect(body.status).toBe('APPROVED');
     expect(body.createdAt).toBe(latest.createdAt.toISOString());
-    expect(body.updatedAt).toBe(latest.updatedAt.toISOString());
+    expect(body.updatedAt).toBe&latest.updatedAt.toISOString());
     // No contact details or other application fields leak out.
     expect(Object.keys(body).sort()).toEqual(['createdAt', 'status', 'updatedAt']);
 
@@ -210,6 +210,166 @@ describe('admin NGO application review', () => {
 
     const response = await app.inject({ method: 'GET', url: '/ngo-applications', headers });
     expect(response.statusCode).toBe(200);
+
+    await app.close();
+  });
+
+  it('filters by status', async () => {
+    const app = buildServer();
+
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({ name: 'Pending NGO' }),
+    });
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({ name: 'Approved NGO', status: 'APPROVED' }),
+    });
+
+    const url = '/ngo-applications?status=APPROVED';
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    const response = await app.inject({ method: 'GET', url, headers });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.total).toBe(1);
+    expect(body.applications).toHaveLength(1);
+    expect(body.applications[0].name).toBe('Approved NGO');
+
+    await app.close();
+  });
+
+  it('searches by name', async () => {
+    const app = buildServer();
+
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({ address: fakeAddress('B'), name: 'Alpha NGO' }),
+    });
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({ address: fakeAddress('C'), name: 'Beta NGO' }),
+    });
+
+    const url = '/ngo-applications?search=alpha';
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    const response = await app.inject({ method: 'GET', url, headers });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.total).toBe(1);
+    expect(body.applications[0].name).toBe('Alpha NGO');
+
+    await app.close();
+  });
+
+  it('searches by email', async () => {
+    const app = buildServer();
+
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({
+        address: fakeAddress('D'),
+        contactEmail: 'hello@example.org',
+      }),
+    });
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({
+        address: fakeAddress('E'),
+        contactEmail: 'office@example.org',
+      }),
+    });
+
+    const url = '/ngo-applications?search=hello%40example.org';
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    const response = await app.inject({ method: 'GET', url, headers });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.total).toBe(1);
+    expect(body.applications[0].contactEmail).toBe('hello@example.org');
+
+    await app.close();
+  });
+
+  it('combines status and search filters', async () => {
+    const app = buildServer();
+
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({
+        address: fakeAddress('F'),
+        name: 'Gamma NGO',
+        status: 'APPROVED',
+      }),
+    });
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({
+        address: fakeAddress('G'),
+        name: 'Gamma NGO',
+        status: 'PENDING',
+      }),
+    });
+
+    const url = '/ngo-applications?status=APPROVED&search=gamma';
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    const response = await app.inject({ method: 'GET', url, headers });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.total).toBe(1);
+    expect(body.applications[0].status).toBe('APPROVED');
+
+    await app.close();
+  });
+
+  it('filters by submittedAfter and submittedBefore', async () => {
+    const app = buildServer();
+
+    const old = new Date('2024-01-01T00:00:00.000Z');
+    const recent = new Date('2024-06-01T00:00:00.000Z');
+
+    await prisma.ngoApplication.create({
+      data: {
+        ...validApplicationPayload({ address: fakeAddress('H'), name: 'Old NGO' }),
+        createdAt: old,
+      },
+    });
+    await prisma.ngoApplication.create({
+      data: {
+        ...validApplicationPayload({ address: fakeAddress('I'), name: 'Recent NGO' }),
+        createdAt: recent,
+      },
+    });
+
+    const url = '/ngo-applications?submittedAfter=2024-03-01T00:00:00.000Z';
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    const response = await app.inject({ method: 'GET', url, headers });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.total).toBe(1);
+    expect(body.applications[0].name).toBe('Recent NGO');
+
+    const beforeUrl = '/ngo-applications?submittedBefore=2024-03-01T00:00:00.000Z';
+    const beforeHeaders = signAdminRequest(adminKeypair, 'GET', beforeUrl);
+    const beforeResponse = await app.inject({
+      method: 'GET',
+      url: beforeUrl,
+      headers: beforeHeaders,
+    });
+
+    expect(beforeResponse.statusCode).toBe(200);
+    const beforeBody = beforeResponse.json();
+    expect(beforeBody.total).toBe(1);
+    expect(beforeBody.applications[0].name).toBe('Old NGO');
+
+    await app.close();
+  });
+
+  it('rejects an invalid date with 400', async () => {
+    const app = buildServer();
+
+    const url = '/ngo-applications?submittedAfter=not-a-date';
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    const response = await app.inject({ method: 'GET', url, headers });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe('invalid_request');
 
     await app.close();
   });
