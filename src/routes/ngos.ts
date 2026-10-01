@@ -15,6 +15,21 @@ const listQuerySchema = z.object({
   q: z.string().max(100).optional(),
 });
 
+const donorListQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(100),
+  cursor: z.string().uuid().optional(),
+});
+
+function committedAmount(stream: {
+  status: 'ACTIVE' | 'CANCELLED';
+  balance: string;
+  withdrawn: string;
+}): bigint {
+  return stream.status === 'CANCELLED'
+    ? BigInt(stream.withdrawn)
+    : BigInt(stream.balance) + BigInt(stream.withdrawn);
+}
+
 const lookupQuerySchema = z.object({
   // Stellar StrKey ed25519 public key: 'G' + 55 base32 (A-Z2-7) chars.
   address: z
@@ -52,10 +67,7 @@ async function findNgoDetail(where: { id: string } | { ownerAddress: string }) {
   // ever delivered to the NGO.  Counting balance on a cancelled stream would
   // overstate totalCommitted by the refunded amount.
   const totalCommitted = streams.reduce(
-    (sum, s) =>
-      s.status === 'CANCELLED'
-        ? sum + BigInt(s.withdrawn)
-        : sum + BigInt(s.balance) + BigInt(s.withdrawn),
+    (sum, stream) => sum + committedAmount(stream),
     0n,
   );
   const totalWithdrawn = streams.reduce((sum, s) => sum + BigInt(s.withdrawn), 0n);
@@ -124,6 +136,50 @@ export async function ngoRoutes(app: FastifyInstance): Promise<void> {
     }
 
     return ngo;
+  });
+
+  app.get('/ngos/:id/donors', async (request, reply) => {
+    const parsedParams = idParamSchema.safeParse(request.params);
+    const parsedQuery = donorListQuerySchema.safeParse(request.query);
+    if (!parsedParams.success || !parsedQuery.success) {
+      return reply.code(400).send({ error: 'invalid_request' });
+    }
+
+    const { id: ngoId } = parsedParams.data;
+    const { limit, cursor } = parsedQuery.data;
+    const ngo = await prisma.ngo.findUnique({ where: { id: ngoId }, select: { id: true } });
+    if (!ngo) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    const rows = await prisma.donor.findMany({
+      where: { streams: { some: { ngoId } } },
+      orderBy: { id: 'asc' },
+      take: limit + 1,
+      ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+      select: {
+        id: true,
+        address: true,
+        streams: {
+          where: { ngoId },
+          select: { status: true, balance: true, withdrawn: true },
+        },
+      },
+    });
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const donors = page.map(({ streams, ...donor }) => ({
+      ...donor,
+      totalCommitted: streams
+        .reduce((sum, stream) => sum + committedAmount(stream), 0n)
+        .toString(),
+    }));
+
+    return {
+      donors,
+      nextCursor: hasMore ? donors[donors.length - 1].id : null,
+    };
   });
 
   app.get('/ngos/:id', async (request, reply) => {
