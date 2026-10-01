@@ -22,7 +22,7 @@ const rpc = await import('../../src/stellar/rpc.js');
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(checkpoint.saveCheckpoint).mockResolvedValue(undefined);
-  process.env.INDEXER_POLL_INTERVAL_MS = '50';
+  process.env.INDEXER_POLL_INTERVAL_MS = '20';
 });
 
 afterEach(() => {
@@ -40,7 +40,8 @@ async function freshWorker() {
   }));
   vi.doMock('../../src/stellar/rpc.js', () => ({
     getLatestLedgerSequence: rpc.getLatestLedgerSequence,
-    rpcServer: { getEvents: vi.fn().mockResolvedValue({ events: [] }) },
+    rpcServer: { getEvents: rpc.rpcServer.getEvents },
+    rpcServer: rpc.rpcServer,
   }));
   vi.doMock('../../src/indexer/contracts.js', () => ({
     WATCHED_CONTRACT_IDS: ['CONTRACT_A'],
@@ -48,11 +49,52 @@ async function freshWorker() {
   return import('../../src/indexer/worker.js');
 }
 
-function runWorkerBriefly(startIndexer: (h: () => Promise<void>) => () => void): Promise<void> {
+type EventHandler = (event: unknown) => Promise<void>;
+
+/**
+ * Runs the indexer worker for a single poll tick by stopping it as soon as
+ * an initial checkpoint is saved or after a short safety timeout.
+ */
+function runWorkerUntilFirstSave(
+  startIndexer: (h: EventHandler) => () => Promise<void>,
+  handleEvent: EventHandler = async () => {},
+): Promise<void> {
   return new Promise<void>((resolve) => {
-    const stop = startIndexer(async () => {});
-    // 200ms gives ~4 poll ticks at 50ms interval before we stop.
-    setTimeout(() => { stop(); resolve(); }, 200);
+    let stop: (() => Promise<void>) | null = null;
+    let finished = false;
+
+    const finish = async () => {
+      if (finished) return;
+      finished = true;
+      if (stop) {
+        await stop();
+      }
+      resolve();
+    };
+
+    vi.mocked(checkpoint.saveCheckpoint).mockImplementation(async () => {
+      setTimeout(() => {
+        void finish();
+      }, 0);
+    });
+
+    stop = startIndexer(handleEvent);
+    setTimeout(() => {
+      void finish();
+    }, 150);
+  });
+}
+
+function runWorkerBriefly(
+  startIndexer: (h: EventHandler) => () => Promise<void>,
+  handleEvent: EventHandler = async () => {},
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const stop = startIndexer(handleEvent);
+    setTimeout(async () => {
+      await stop();
+      resolve();
+    }, 100);
   });
 }
 
@@ -60,29 +102,36 @@ describe('worker bootstrap (no existing checkpoint)', () => {
   it('saves INDEXER_START_LEDGER as the initial checkpoint when set', async () => {
     process.env.INDEXER_START_LEDGER = '1000';
     vi.mocked(checkpoint.getCheckpoint).mockResolvedValue(undefined);
-    vi.mocked(rpc.getLatestLedgerSequence).mockResolvedValue(9999);
+    // latestLedger <= START_LEDGER so subsequent polls hit the "nothing new"
+    // guard and return without calling saveCheckpoint again.
+    vi.mocked(rpc.getLatestLedgerSequence).mockResolvedValue(1000);
 
     const { startIndexer } = await freshWorker();
-    await runWorkerBriefly(startIndexer);
+    await runWorkerUntilFirstSave(startIndexer);
 
     expect(checkpoint.saveCheckpoint).toHaveBeenCalledWith(1000);
-    expect(rpc.getLatestLedgerSequence).not.toHaveBeenCalled();
+    // Must not fall back to the RPC latest ledger as the starting point.
+    expect(checkpoint.saveCheckpoint).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to the latest ledger when INDEXER_START_LEDGER is not set', async () => {
+  it('falls back to the latest ledger and processes no historical events when INDEXER_START_LEDGER is not set', async () => {
     vi.mocked(checkpoint.getCheckpoint).mockResolvedValue(undefined);
     vi.mocked(rpc.getLatestLedgerSequence).mockResolvedValue(5000);
+    const handleEvent = vi.fn().mockResolvedValue(undefined);
 
     const { startIndexer } = await freshWorker();
-    await runWorkerBriefly(startIndexer);
+    await runWorkerUntilFirstSave(startIndexer, handleEvent);
 
+    expect(checkpoint.getCheckpoint).toHaveBeenCalled();
     expect(rpc.getLatestLedgerSequence).toHaveBeenCalled();
     expect(checkpoint.saveCheckpoint).toHaveBeenCalledWith(5000);
+    expect(rpc.rpcServer.getEvents).not.toHaveBeenCalled();
+    expect(handleEvent).not.toHaveBeenCalled();
   });
 
   it('ignores INDEXER_START_LEDGER when a checkpoint already exists', async () => {
     process.env.INDEXER_START_LEDGER = '1000';
-    vi.mocked(checkpoint.getCheckpoint).mockResolvedValue(8000);
+    vi.mocked(checkpoint.getCheckpoint).mockResolvedValue({ lastLedger: 8000, lastEventId: null });
     vi.mocked(rpc.getLatestLedgerSequence).mockResolvedValue(9999);
 
     const { startIndexer } = await freshWorker();
@@ -90,5 +139,16 @@ describe('worker bootstrap (no existing checkpoint)', () => {
 
     // Resumed from existing checkpoint — the env var must be ignored
     expect(checkpoint.saveCheckpoint).not.toHaveBeenCalledWith(1000);
+  });
+
+  it('advances the checkpoint when the latest ledger has no events', async () => {
+    vi.mocked(checkpoint.getCheckpoint).mockResolvedValue(100);
+    vi.mocked(rpc.getLatestLedgerSequence).mockResolvedValue(125);
+    vi.mocked(rpc.rpcServer.getEvents).mockResolvedValue({ events: [] });
+
+    const { startIndexer } = await freshWorker();
+    await runWorkerBriefly(startIndexer);
+
+    expect(checkpoint.saveCheckpoint).toHaveBeenCalledWith(125);
   });
 });

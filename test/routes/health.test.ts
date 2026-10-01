@@ -28,4 +28,20 @@ describe('GET /health', () => {
 
     await app.close();
   });
+
+  it('does not rate limit repeated health checks', async () => {
+    const previousMax = process.env.RATE_LIMIT_MAX;
+    process.env.RATE_LIMIT_MAX = '1';
+    const app = buildServer();
+
+    const responses = await Promise.all(
+      Array.from({ length: 3 }, () => app.inject({ method: 'GET', url: '/health' })),
+    );
+
+    expect(responses.map((response) => response.statusCode)).toEqual([200, 200, 200]);
+
+    await app.close();
+    if (previousMax === undefined) delete process.env.RATE_LIMIT_MAX;
+    else process.env.RATE_LIMIT_MAX = previousMax;
+  });
 });

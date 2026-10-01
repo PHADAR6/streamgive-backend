@@ -1,4 +1,3 @@
-import { Prisma } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zodat';
 
@@ -9,7 +8,13 @@ const applicationSchema = z.object({
   ownerAddress: z.string().regex(/^G[A-Z2-7]{55}$/),
   name: z.string().min(1).max(200),
   description: z.string().min(1).max(5000),
-  website: z.string().url().optional(),
+  // Normalize scheme-less domains (e.g. "example.org") to "https://example.org"
+  // before URL validation so applicants who omit the scheme aren't blocked.
+  website: z
+    .string()
+    .transform((val) => (val && !/^https?:\/\//i.test(val) ? `https://${val}` : val))
+    .pipe(z.string().url())
+    .optional(),
   contactEmail: z.string().email(),
   country: z.string().max(100).optional(),
 });
@@ -40,8 +45,7 @@ const reviewBodySchema = z.object({
 export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/ngo-applications',
-    // Public write endpoint — tighter than the global default since it's
-    // the most spam-prone route in the API.
+    // Public write endpoint — tighter than the global default since it's // the most spam-prone route in the API.
     {
       config: {
         rateLimit: {
@@ -98,6 +102,30 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
 
     return application;
   });
+
+  // Admin dashboard endpoint: returns application counts grouped by
+  // status so the client doesn't have to fetch and count applications
+  // itself. Must be registered before the /:id route so 'stats' isn't
+  // swallowed as an id and rejected by the UUID param validation.
+  app.get(
+    '/ngo-applications/stats',
+    { preHandler: requireAdminSignature },
+    async () => {
+      const grouped = await prisma.ngoApplication.groupBy({
+        by: ['status'],
+        _count: { _all: true },
+      });
+
+      const counts = { PENDING: 0, APPROVED: 0, REJECTED: 0 } as Record<string, number>;
+      for (const row of grouped) {
+        counts[row.status] = row._count._all;
+      }
+
+      const total = counts.PENDING + counts.APPROVED + counts.REJECTED;
+
+      return { counts: { PENDING: counts.PENDING, APPROVED: counts.APPROVED, REJECTED: counts.REJECTED }, total };
+    },
+  );
 
   app.get('/ngo-applications', { preHandler: requireAdminSignature }, async (request, reply) => {
     const parsed = listQuerySchema.safeParse(request.query);
@@ -172,16 +200,9 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
         return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
       }
 
-      try {
-        return await prisma.ngoApplication.update({
-          where: { id },
-          data: { status: 'APPROVED', reviewNote: parsed.data.reviewNote },
-        });
-      } catch (err) {
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
-          return reply.code(404).send({ error: 'not_found' });
-        }
-        throw err;
+      const application = await prisma.ngoApplication.findUnique({ where: { id } });
+      if (!application) {
+        return reply.code(404).send({ error: 'not_found' });
       }
     },
   );
@@ -201,16 +222,9 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
         return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
       }
 
-      try {
-        return await prisma.ngoApplication.update({
-          where: { id },
-          data: { status: 'REJECTED', reviewNote: parsed.data.reviewNote },
-        });
-      } catch (err) {
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
-          return reply.code(404).send({ error: 'not_found' });
-        }
-        throw err;
+      const application = await prisma.ngoApplication.findUnique({ where: { id } });
+      if (!application) {
+        return reply.code(404).send({ error: 'not_found' });
       }
     },
   );

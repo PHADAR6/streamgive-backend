@@ -84,6 +84,7 @@ export async function impactRoutes(app: FastifyInstance): Promise<void> {
       0n,
     );
 
+    // Guard against division by zero when platform has no committed streams (#89)
     const platformSharePercent =
       platformCommitted > 0n ? Number((ngoCommitted * 10000n) / platformCommitted) / 100 : 0;
 

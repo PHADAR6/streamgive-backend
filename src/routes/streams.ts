@@ -70,7 +70,11 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     const hasMore = rows.length > limit;
     const streams = hasMore ? rows.slice(0, limit) : rows;
 
-    return { streams: streams.map(serializeStream), hasMore };
+    return {
+      streams: streams.map(serializeStream),
+      hasMore,
+      nextCursor: hasMore ? (streams.at(-1)?.id ?? null) : null,
+    };
   });
 
   app.get('/streams/:id', async (request, reply) => {

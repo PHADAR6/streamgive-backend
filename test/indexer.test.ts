@@ -1,6 +1,8 @@
-import { startIndexer } from '../indexer';
+import { describe, expect, it } from 'vitest';
 
-describe('Indexer Non-Overlapping Polls (#37)', () => {
+import { startIndexer } from '../src/indexer.js';
+
+describe('startIndexer (non-overlapping polls)', () => {
   it('does not run two polls concurrently when a poll takes longer than the interval', async () => {
     let activePolls = 0;
     let maxConcurrent = 0;

@@ -4,7 +4,6 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { prisma } from '../../src/db.js';
 import { buildServer } from '../../src/server.js';
 import { fakeAddress, resetDb } from '../helpers/db.js';
-import { sep53Hash } from '../../src/middleware/adminAuth.js';
 import { signAdminRequest } from '../helpers/adminAuth.js';
 
 const adminKeypair = Keypair.random();
@@ -53,6 +52,36 @@ describe('POST /ngo-applications', () => {
     });
 
     expect(response.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('accepts a scheme-less website domain and normalizes it to https://', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/ngo-applications',
+      payload: validApplicationPayload({ website: 'example.org' }),
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json().website).toBe('https://example.org');
+
+    await app.close();
+  });
+
+  it('accepts an already-schemed https website without double-prepending', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/ngo-applications',
+      payload: validApplicationPayload({ website: 'https://example.org' }),
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json().website).toBe('https://example.org');
 
     await app.close();
   });
@@ -204,12 +233,46 @@ describe('admin NGO application review', () => {
     await app.close();
   });
 
+  it('rejects a validly encoded signature with the wrong byte length', async () => {
+    const app = buildServer();
+    const headers = signAdminRequest(adminKeypair, 'GET', '/ngo-applications');
+    headers['x-admin-signature'] = Buffer.alloc(63).toString('base64');
+
+    const response = await app.inject({ method: 'GET', url: '/ngo-applications', headers });
+    expect(response.statusCode).toBe(401);
+    expect(response.json().error).toBe('unauthorized');
+
+    await app.close();
+  });
+
   it('allows a correctly signed admin request', async () => {
     const app = buildServer();
     const headers = signAdminRequest(adminKeypair, 'GET', '/ngo-applications');
 
     const response = await app.inject({ method: 'GET', url: '/ngo-applications', headers });
     expect(response.statusCode).toBe(200);
+
+    await app.close();
+  });
+
+it('paginates applications while reporting the full total', async () => {
+    const app = buildServer();
+    await Promise.all(
+      ['A', 'B', 'C'].map((suffix) =>
+        prisma.ngoApplication.create({ data: validApplicationPayload({ ownerAddress: fakeAddress(suffix) }) }),
+      ),
+    );
+
+    const url = '/ngo-applications?limit=2&offset=1';
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    const response = await app.inject({ method: 'GET', url, headers });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.total).toBe(3);
+    expect(body.limit).toBe(2);
+    expect(body.offset).toBe(1);
+    expect(body.applications).toHaveLength(2);
 
     await app.close();
   });
@@ -373,7 +436,6 @@ describe('admin NGO application review', () => {
 
     await app.close();
   });
-
   it('approves a pending application', async () => {
     const app = buildServer();
 
@@ -387,6 +449,48 @@ describe('admin NGO application review', () => {
 
     const stored = await prisma.ngoApplication.findUnique({ where: { id: application.id } });
     expect(stored?.status).toBe('APPROVED');
+
+    await app.close();
+  });
+
+  it('rejects a non-object (array) body on approve with 400 invalid_request', async () => {
+    const app = buildServer();
+
+    const application = await prisma.ngoApplication.create({ data: validApplicationPayload() });
+    const url = `/ngo-applications/${application.id}/approve`;
+    const headers = signAdminRequest(adminKeypair, 'POST', url);
+
+    const response = await app.inject({ method: 'POST', url, headers, payload: [] as never });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe('invalid_request');
+
+    // The invalid request must not have touched the application.
+    const stored = await prisma.ngoApplication.findUnique({ where: { id: application.id } });
+    expect(stored?.status).toBe('PENDING');
+
+    await app.close();
+  });
+
+  it('rejects a non-object (array) body on reject with 400 invalid_request', async () => {
+    const app = buildServer();
+
+    const application = await prisma.ngoApplication.create({ data: validApplicationPayload() });
+    const url = `/ngo-applications/${application.id}/reject`;
+    const headers = signAdminRequest(adminKeypair, 'POST', url);
+
+    const response = await app.inject({
+      method: 'POST',
+      url,
+      headers,
+      payload: ['not', 'an', 'object'] as never,
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe('invalid_request');
+
+    const stored = await prisma.ngoApplication.findUnique({ where: { id: application.id } });
+    expect(stored?.status).toBe('PENDING');
 
     await app.close();
   });
@@ -432,6 +536,70 @@ describe('admin NGO application review', () => {
     });
     expect(rejectResponse.statusCode).toBe(404);
     expect(rejectResponse.json().error).toBe('not_found');
+
+    await app.close();
+  });
+});
+
+describe('GET /ngo-applications/stats', () => {
+  beforeAll(() => {
+    process.env.ADMIN_ADDRESS = adminKeypair.publicKey();
+  });
+
+  afterEach(async () => {
+    await resetDb();
+  });
+
+  it('rejects an unsigned request with 401', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({ method: 'GET', url: '/ngo-applications/stats' });
+    expect(response.statusCode).toBe(401);
+
+    await app.close();
+  });
+
+  it('returns counts grouped by status for a signed admin', async () => {
+    const app = buildServer();
+
+    await prisma.ngoApplication.createMany({
+      data: [
+        validApplicationPayload({ ownerAddress: fakeAddress('P'), status: 'PENDING' }),
+        validApplicationPayload({ ownerAddress: fakeAddress('P'), status: 'PENDING' }),
+        validApplicationPayload({ ownerAddress: fakeAddress('A'), status: 'APPROVED' }),
+        validApplicationPayload({ ownerAddress: fakeAddress('R'), status: 'REJECTED' }),
+      ],
+    });
+
+    const headers = signAdminRequest(adminKeypair, 'GET', '/ngo-applications/stats');
+    const response = await app.inject({
+      method: 'GET',
+      url: '/ngo-applications/stats',
+      headers,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.counts).toEqual({ PENDING: 2, APPROVED: 1, REJECTED: 1 });
+    expect(body.total).toBe(4);
+
+    await app.close();
+  });
+
+  it('returns zero counts when there are no applications', async () => {
+    const app = buildServer();
+
+    const headers = signAdminRequest(adminKeypair, 'GET', '/ngo-applications/stats');
+    const response = await app.inject({
+      method: 'GET',
+      url: '/ngo-applications/stats',
+      headers,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.counts).toEqual({ PENDING: 0, APPROVED: 0, REJECTED: 0 });
+    expect(body.total).toBe(0);
 
     await app.close();
   });
