@@ -6,6 +6,7 @@ import Fastify from 'fastify';
 import { prisma } from './db.js';
 import { donorRoutes } from './routes/donors.js';
 import { impactRoutes } from './routes/impact.js';
+import { indexerStatusRoutes } from './routes/indexerStatus.js';
 import { ngoApplicationRoutes } from './routes/ngoApplications.js';
 import { ngoRoutes } from './routes/ngos.js';
 import { streamRoutes } from './routes/streams.js';
@@ -16,7 +17,64 @@ import { streamRoutes } from './routes/streams.js';
 // NODE_ENV=test (which Vitest sets by default) as well as production.
 const USE_PRETTY_LOGS = !['production', 'test'].includes(process.env.NODE_ENV ?? '');
 
-export function buildServer() {
+export type TrustProxySetting =
+  | boolean
+  | string
+  | string[]
+  | ((address: string, hop: number) => boolean);
+
+/**
+ * Parses the TRUST_PROXY environment variable into a valid Fastify trustProxy configuration.
+ *
+ * Behind a reverse proxy (such as Render's load balancer or Cloudflare), Fastify's
+ * socket.remoteAddress is the proxy's IP. Without trustProxy enabled, @fastify/rate-limit
+ * keys all clients to that single proxy IP, throttling all users collectively.
+ *
+ * Supported values:
+ * - undefined or empty: defaults to `true` (enabling proxy trust by default behind Render)
+ * - 'true': trusts all proxies, reading client IP from the first entry of X-Forwarded-For
+ * - 'false': disables proxy trust, using socket remoteAddress
+ * - integer string (e.g. '1', '2'): bounded hop count function trusting the specified number of proxy hops
+ * - comma-separated list or single string: IP or CIDR ranges to trust
+ */
+export function parseTrustProxy(value: string | undefined): TrustProxySetting {
+  if (value === undefined || value.trim() === '') {
+    return true;
+  }
+  const trimmed = value.trim();
+  const lower = trimmed.toLowerCase();
+  if (lower === 'true') {
+    return true;
+  }
+  if (lower === 'false') {
+    return false;
+  }
+  const num = Number(trimmed);
+  if (!Number.isNaN(num) && Number.isInteger(num)) {
+    if (num <= 0) {
+      return false;
+    }
+    return (_address: string, hop: number) => hop < num;
+  }
+  if (trimmed.includes(',')) {
+    return trimmed
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  return trimmed;
+}
+
+export interface BuildServerOptions {
+  trustProxy?: TrustProxySetting;
+}
+
+export function buildServer(options?: BuildServerOptions) {
+  const trustProxySetting =
+    options?.trustProxy !== undefined
+      ? options.trustProxy
+      : parseTrustProxy(process.env.TRUST_PROXY);
+
   const app = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
@@ -25,6 +83,13 @@ export function buildServer() {
       // devDependency on purpose, since the production image never needs it.
       transport: USE_PRETTY_LOGS ? { target: 'pino-pretty' } : undefined,
     },
+    // Behind a reverse proxy (e.g. Render's load balancer, Cloudflare), Fastify's
+    // underlying socket remoteAddress is the proxy's IP. Without trustProxy enabled,
+    // @fastify/rate-limit keys all requests to that shared proxy IP, throttling all
+    // users collectively if one client is busy. Enabling trustProxy (or a bounded hop
+    // count) ensures request.ip is read from X-Forwarded-For, properly isolating rate
+    // limiting per client IP.
+    trustProxy: trustProxySetting,
   });
 
   app.setErrorHandler<Error & { statusCode?: number }>((error, request, reply) => {
@@ -77,11 +142,14 @@ app.get(
     // Health checks are also used by free-tier uptime pingers. They must not
     // consume the shared client rate-limit bucket.
     { config: { rateLimit: false } },
-    async () => {
+    async (_request, reply) => {
+      try {
       await prisma.$queryRaw`SELECT 1`;
       return { status: 'ok' };
-    },
-  );
+    } catch {
+      return reply.code(503).send({ status: 'error', database: 'unreachable' });
+    }
+  });
 
   app.get('/tokens', async () => {
     const grouped = await prisma.stream.groupBy({
@@ -101,6 +169,7 @@ app.get(
   app.register(streamRoutes);
   app.register(impactRoutes);
   app.register(ngoApplicationRoutes);
+  app.register(indexerStatusRoutes);
 
   return app;
 }
