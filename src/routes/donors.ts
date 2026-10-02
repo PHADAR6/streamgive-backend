@@ -10,6 +10,11 @@ const querySchema = z.object({
   cursor: z.string().uuid().optional(),
 });
 
+// Stellar StrKey ed25519 public key: 'G' + 55 base32 (A-Z2-7) chars.
+const addressParamSchema = z.object({
+  address: z.string().regex(/^G[A-Z2-7]{55}$/),
+});
+
 export async function donorRoutes(app: FastifyInstance): Promise<void> {
   app.get('/donors', async (request, reply) => {
     const parsedQuery = querySchema.safeParse(request.query);
@@ -66,6 +71,53 @@ export async function donorRoutes(app: FastifyInstance): Promise<void> {
     return {
       donors,
       nextCursor: hasMore ? donors[donors.length - 1].id : null,
+    };
+  });
+
+  // Per-donor summary so the dashboard (and other clients) can show donor
+  // stats without paging through every stream and summing in the browser.
+  app.get('/donors/:address', async (request, reply) => {
+    const parsedParams = addressParamSchema.safeParse(request.params);
+    if (!parsedParams.success) {
+      return reply.code(400).send({ error: 'invalid_request' });
+    }
+
+    const donor = await prisma.donor.findUnique({
+      where: { address: parsedParams.data.address },
+      include: {
+        streams: {
+          select: { ngoId: true, balance: true, withdrawn: true, status: true },
+        },
+      },
+    });
+
+    if (!donor) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    const { streams, ...rest } = donor;
+
+    // A cancelled stream's remaining balance is no longer committed; only what
+    // it already paid out counts, matching GET /donors.
+    const totalCommitted = streams
+      .reduce(
+        (sum, stream) =>
+          stream.status === 'CANCELLED'
+            ? sum + BigInt(stream.withdrawn)
+            : sum + BigInt(stream.balance) + BigInt(stream.withdrawn),
+        0n,
+      )
+      .toString();
+    const totalWithdrawn = streams
+      .reduce((sum, stream) => sum + BigInt(stream.withdrawn), 0n)
+      .toString();
+
+    return {
+      ...rest,
+      totalCommitted,
+      totalWithdrawn,
+      activeStreamCount: streams.filter((stream) => stream.status === 'ACTIVE').length,
+      distinctNgoCount: new Set(streams.map((stream) => stream.ngoId)).size,
     };
   });
 }
