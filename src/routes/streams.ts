@@ -31,7 +31,7 @@ const streamInclude = {
 // onChainId is a BigInt; Fastify's default JSON.stringify serializer (no
 // response schema is defined yet) throws on BigInt, so it has to go out as
 // a string.
-function serializeStream<T extends { onChainId: bigint; ngo: { name: string } }>(stream: T) {
+export function serializeStream<T extends { onChainId: bigint; ngo: { name: string } }>(stream: T) {
   const { onChainId, ngo, ...rest } = stream;
   return {
     ...rest,
