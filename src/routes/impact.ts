@@ -24,7 +24,15 @@ export async function impactRoutes(app: FastifyInstance): Promise<void> {
    * @auth Public
    * @returns 200 `{ totalCommitted: string, totalWithdrawn: string, activeStreams: number, verifiedNgoCount: number }`.
    */
-  app.get('/impact', async (request, reply) => {
+  app.get(
+    '/impact',
+    {
+      schema: {
+        tags: ['Impact'],
+        summary: 'Returns platform-wide committed/withdrawn totals and activity counts',
+      },
+    },
+    async (request, reply) => {
     const [streams, verifiedNgoCount] = await Promise.all([
       prisma.stream.findMany({
         select: { balance: true, withdrawn: true, status: true, tokenAddress: true },

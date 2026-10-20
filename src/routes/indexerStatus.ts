@@ -11,7 +11,15 @@ export async function indexerStatusRoutes(fastify: FastifyInstance) {
    * @auth Public
    * @returns 200 `{ configured, checkpointLedger, updatedAt, latestLedger, ledgerLag }`; ledger values and timestamp are null when not configured.
    */
-  fastify.get('/indexer/status', async (_request: FastifyRequest, reply: FastifyReply) => {
+  fastify.get(
+    '/indexer/status',
+    {
+      schema: {
+        tags: ['Indexer'],
+        summary: 'Reports whether the indexer is configured and its checkpoint/ledger lag',
+      },
+    },
+    async (_request: FastifyRequest, reply: FastifyReply) => {
     const envWatched =
       process.env.WATCHED_CONTRACT_IDS !== undefined
         ? process.env.WATCHED_CONTRACT_IDS.split(',')

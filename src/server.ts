@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -9,6 +10,7 @@ import type { FastifyError } from 'fastify';
 import { prisma } from './db.js';
 import { recordHttpRequest, renderMetrics } from './metrics.js';
 import { getCheckpoint } from './indexer/checkpoint.js';
+import { requireAdminSignature } from './middleware/adminAuth.js';
 import { donorRoutes } from './routes/donors.js';
 import { impactRoutes } from './routes/impact.js';
 import { indexerStatusRoutes } from './routes/indexerStatus.js';
@@ -18,6 +20,10 @@ import { ngoRoutes } from './routes/ngos.js';
 import { streamRoutes } from './routes/streams.js';
 import { registerRequestIdHeader, requestIdOptions } from './requestId.js';
 import { registerCompression } from './plugins/compression.js';
+
+const packageJson = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+) as { version: string };
 
 // pino-pretty runs its formatting on a separate worker thread; spawning
 // one per Fastify instance is fine for a single long-running process, but
@@ -198,21 +204,58 @@ export function buildServer(options?: BuildServerOptions) {
    * @auth Public
    * @returns 200 Prometheus text format (`text/plain; version=0.0.4`).
    */
-  app.get('/metrics', async (_request, reply) => {
-    return reply.type('text/plain; version=0.0.4; charset=utf-8').send(renderMetrics());
-  });
+  app.get(
+    '/metrics',
+    {
+      schema: {
+        tags: ['Metrics'],
+        summary: 'Exposes process-local Prometheus metrics',
+      },
+    },
+    async (_request, reply) => {
+      return reply.type('text/plain; version=0.0.4; charset=utf-8').send(renderMetrics());
+    },
+  );
 
   app.register(swagger, {
     openapi: {
       info: {
         title: 'StreamGive API',
         description: 'API for the StreamGive platform',
-        version: '1.0.0',
+        version: packageJson.version,
       },
       tags: [
         { name: 'Health', description: 'Service health checks' },
         { name: 'NGOs', description: 'NGO directory and profiles' },
+        { name: 'Donors', description: 'Donor statistics and rankings' },
+        { name: 'Streams', description: 'Donation streams and activity' },
+        { name: 'Impact', description: 'Platform-wide and NGO impact metrics' },
+        { name: 'NGO Applications', description: 'NGO verification applications and review' },
+        { name: 'Indexer', description: 'Stellar indexer status and checkpoint info' },
+        { name: 'Metrics', description: 'Prometheus metrics' },
       ],
+      components: {
+        securitySchemes: {
+          adminAddress: {
+            type: 'apiKey',
+            name: 'x-admin-address',
+            in: 'header',
+            description: 'Admin Stellar public key (G...)',
+          },
+          adminSignature: {
+            type: 'apiKey',
+            name: 'x-admin-signature',
+            in: 'header',
+            description: 'Ed25519 signature of ${method}:${url}:${timestamp}',
+          },
+          adminTimestamp: {
+            type: 'apiKey',
+            name: 'x-admin-timestamp',
+            in: 'header',
+            description: 'Request timestamp (UNIX epoch milliseconds)',
+          },
+        },
+      },
     },
   });
 
@@ -229,18 +272,27 @@ export function buildServer(options?: BuildServerOptions) {
    * @auth Public
    * @returns 200 or 503 `{ status: "ok" | "error", db: "ok" | "error", rpc: "ok" | "error" }`.
    */
-  app.get('/health', async (_req, reply) => {
-    const [dbResult, rpcResult] = await Promise.allSettled([
-      prisma.$queryRaw`SELECT 1`,
-      getLatestLedgerSequence(),
-    ]);
+  app.get(
+    '/health',
+    {
+      schema: {
+        tags: ['Health'],
+        summary: 'Checks database and Stellar RPC availability',
+      },
+    },
+    async (_req, reply) => {
+      const [dbResult, rpcResult] = await Promise.allSettled([
+        prisma.$queryRaw`SELECT 1`,
+        getLatestLedgerSequence(),
+      ]);
 
-    const db = dbResult.status === 'fulfilled' ? 'ok' : 'error';
-    const rpc = rpcResult.status === 'fulfilled' ? 'ok' : 'error';
+      const db = dbResult.status === 'fulfilled' ? 'ok' : 'error';
+      const rpc = rpcResult.status === 'fulfilled' ? 'ok' : 'error';
 
       const status = db === 'ok' && rpc === 'ok' ? 'ok' : 'error';
       return reply.code(status === 'ok' ? 200 : 503).send({ status, db, rpc });
-  });
+    },
+  );
 
   /**
    * Checks readiness, including database availability and indexer lag.
@@ -248,34 +300,45 @@ export function buildServer(options?: BuildServerOptions) {
    * @auth Public
    * @returns 200 `{ status: "ok", lag, latestLedger, checkpointLedger }`; 503 `{ status: "error", reason, ... }` when unavailable or not caught up.
    */
-  app.get('/health/ready', async (request, reply) => {
-    try {
-      // 1. Check DB
-      await prisma.$queryRaw`SELECT 1`;
+  app.get(
+    '/health/ready',
+    {
+      schema: {
+        tags: ['Health'],
+        summary: 'Checks readiness, including database availability and indexer lag',
+      },
+    },
+    async (request, reply) => {
+      try {
+        // 1. Check DB
+        await prisma.$queryRaw`SELECT 1`;
 
-      // 2. Get RPC and Indexer info
-      const [latestLedger, checkpointLedger] = await Promise.all([
-        getLatestLedgerSequence(),
-        getCheckpoint(),
-      ]);
+        // 2. Get RPC and Indexer info
+        const [latestLedger, checkpointLedger] = await Promise.all([
+          getLatestLedgerSequence(),
+          getCheckpoint(),
+        ]);
 
-      if (checkpointLedger === undefined) {
-        return reply.code(503).send({ status: 'error', reason: 'indexer_not_started' });
+        if (checkpointLedger === undefined) {
+          return reply.code(503).send({ status: 'error', reason: 'indexer_not_started' });
+        }
+
+        const lag = latestLedger - checkpointLedger;
+        const threshold = parseInt(process.env.INDEXER_LAG_THRESHOLD ?? '100', 10);
+
+        if (lag > threshold) {
+          return reply
+            .code(503)
+            .send({ status: 'error', reason: 'indexer_lagging', lag, threshold });
+        }
+
+        return { status: 'ok', lag, latestLedger, checkpointLedger };
+      } catch (error) {
+        request.log.error(error);
+        return reply.code(503).send({ status: 'error', reason: 'service_unavailable' });
       }
-
-      const lag = latestLedger - checkpointLedger;
-      const threshold = parseInt(process.env.INDEXER_LAG_THRESHOLD ?? '100', 10);
-
-      if (lag > threshold) {
-        return reply.code(503).send({ status: 'error', reason: 'indexer_lagging', lag, threshold });
-      }
-
-      return { status: 'ok', lag, latestLedger, checkpointLedger };
-    } catch (error) {
-      request.log.error(error);
-      return reply.code(503).send({ status: 'error', reason: 'service_unavailable' });
-    }
-  });
+    },
+  );
 
   app.addHook('onRoute', (route) => {
     const schemas: Record<string, object> = {
@@ -329,6 +392,42 @@ export function buildServer(options?: BuildServerOptions) {
     };
     const schema = schemas[route.url];
     if (schema) route.schema = { ...route.schema, ...schema };
+
+    const hasAdminAuth =
+      route.preHandler === requireAdminSignature ||
+      (Array.isArray(route.preHandler) && route.preHandler.includes(requireAdminSignature));
+
+    if (hasAdminAuth && !route.schema?.security) {
+      route.schema = {
+        ...route.schema,
+        security: [
+          {
+            adminAddress: [],
+            adminSignature: [],
+            adminTimestamp: [],
+          },
+        ],
+      };
+    }
+
+    if (
+      !route.schema?.tags ||
+      (Array.isArray(route.schema.tags) && route.schema.tags.length === 0)
+    ) {
+      let tag: string | undefined;
+      if (route.url.startsWith('/v1/ngos')) tag = 'NGOs';
+      else if (route.url.startsWith('/v1/donors')) tag = 'Donors';
+      else if (route.url.startsWith('/v1/streams')) tag = 'Streams';
+      else if (route.url.startsWith('/v1/impact')) tag = 'Impact';
+      else if (route.url.startsWith('/v1/ngo-applications')) tag = 'NGO Applications';
+      else if (route.url.startsWith('/v1/indexer')) tag = 'Indexer';
+      else if (route.url.startsWith('/health')) tag = 'Health';
+      else if (route.url === '/metrics') tag = 'Metrics';
+
+      if (tag) {
+        route.schema = { ...route.schema, tags: [tag] };
+      }
+    }
   });
 
   const apiPrefix = { prefix: '/v1' };

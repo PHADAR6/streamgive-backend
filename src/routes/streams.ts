@@ -205,7 +205,15 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
    * @auth Public
    * @returns 200 `{ events: StreamEvent[], hasMore: boolean }` with `streamId` serialized as a string or null; 400 invalid params/query; 404 `{ error: "not_found" }`.
    */
-  app.get('/streams/:id/activity', async (request, reply) => {
+  app.get(
+    '/streams/:id/activity',
+    {
+      schema: {
+        tags: ['Streams'],
+        summary: 'Lists on-chain events for a stream, newest first',
+      },
+    },
+    async (request, reply) => {
     const parsedParams = idParamSchema.safeParse(request.params);
     if (!parsedParams.success) {
       return reply.code(400).send({ error: 'invalid_request' });
