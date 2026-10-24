@@ -38,8 +38,8 @@ async function listApplicationsAs(keypair: Keypair) {
   const app = buildServer();
   const response = await app.inject({
     method: 'GET',
-    url: '/ngo-applications',
-    headers: signAdminRequest(keypair, 'GET', '/ngo-applications'),
+    url: '/v1/ngo-applications',
+    headers: signAdminRequest(keypair, 'GET', '/v1/ngo-applications'),
   });
   const result = {
     statusCode: response.statusCode,
@@ -109,12 +109,12 @@ describe('requireAdminSignature', () => {
     configureAdmins(legacyAdmin.publicKey());
 
     const app = buildServer();
-    const headers = signAdminRequest(legacyAdmin, 'GET', '/ngo-applications');
+    const headers = signAdminRequest(legacyAdmin, 'GET', '/v1/ngo-applications');
     headers['x-admin-timestamp'] = 'abc';
 
     const response = await app.inject({
       method: 'GET',
-      url: '/ngo-applications',
+      url: '/v1/ngo-applications',
       headers,
     });
 
@@ -128,12 +128,12 @@ describe('requireAdminSignature', () => {
     configureAdmins(legacyAdmin.publicKey());
 
     const app = buildServer();
-    const headers = signAdminRequest(legacyAdmin, 'GET', '/ngo-applications');
+    const headers = signAdminRequest(legacyAdmin, 'GET', '/v1/ngo-applications');
     headers['x-admin-address'] = 'not-a-stellar-address';
 
     const response = await app.inject({
       method: 'GET',
-      url: '/ngo-applications',
+      url: '/v1/ngo-applications',
       headers,
     });
 
@@ -148,12 +148,12 @@ describe('requireAdminSignature', () => {
 
     const app = buildServer();
     const timestamp = Date.now().toString();
-    const payload = `GET:/ngo-applications:${timestamp}`;
+    const payload = `GET:/v1/ngo-applications:${timestamp}`;
     const signatureHex = Buffer.from(legacyAdmin.sign(sep53Hash(payload))).toString('hex');
 
     const response = await app.inject({
       method: 'GET',
-      url: '/ngo-applications',
+      url: '/v1/ngo-applications',
       headers: {
         'x-admin-address': legacyAdmin.publicKey(),
         'x-admin-signature': signatureHex,

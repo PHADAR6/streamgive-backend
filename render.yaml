@@ -1,9 +1,10 @@
 # Render Blueprint. Create the service from this with Render's
 # "New > Blueprint" flow, pointed at this repository.
 #
-# Secrets are marked `sync: false`, which means Render prompts for them once
-# at creation and stores them itself — they are never committed here.
-# See DEPLOYMENT.md.
+# Values Render has to prompt for are marked `sync: false`: Render stores them
+# itself and they are never committed here. They are deployment-specific rather
+# than uniformly secret — ADMIN_ADDRESS and CORS_ORIGINS are public. See
+# DEPLOYMENT.md.
 
 services:
   - type: web

@@ -297,6 +297,41 @@ describe('handleDonationVaultEvent', () => {
     expect(streamEvent).toBeNull();
   });
 
+  it('is idempotent when the same created event is replayed', async () => {
+    const donor = fakeAddress('AA');
+    const ngo = fakeAddress('AB');
+    const token = fakeAddress('AC');
+
+    const event = makeEvent(
+      [symbolScVal('created'), u64ScVal(7n)],
+      xdr.ScVal.scvVec([
+        addressScVal(donor),
+        addressScVal(ngo),
+        addressScVal(token),
+        i128ScVal(1000n),
+        i128ScVal(10n),
+      ]),
+    );
+
+    // Process the exact same event twice — the second pass is a replay
+    // (e.g. indexer restarted after a crash between handler and checkpoint).
+    await handleDonationVaultEvent(event);
+    await handleDonationVaultEvent(event);
+
+    // Exactly one row of each, not two.
+    expect(await prisma.donor.count({ where: { address: donor } })).toBe(1);
+    expect(await prisma.ngo.count({ where: { ownerAddress: ngo } })).toBe(1);
+    expect(await prisma.stream.count({ where: { onChainId: 7n } })).toBe(1);
+
+    // And the single stream row has the original values — the replay didn't
+    // touch balance/rate/status.
+    const stream = await prisma.stream.findUnique({ where: { onChainId: 7n } });
+    expect(stream?.balance).toBe('1000');
+    expect(stream?.rate).toBe('10');
+    expect(stream?.withdrawn).toBe('0');
+    expect(stream?.status).toBe('ACTIVE');
+  });
+
   it('warns and records a dead letter when a withdraw event is received for an unknown stream', async () => {
     const warn = vi.spyOn(logger, 'warn');
     const unknownOnChainId = 999n;
@@ -503,5 +538,150 @@ describe('handleDonationVaultEvent', () => {
       where: { eventId: event.id },
     });
     expect(deadLetter).toBeNull();
+  });
+});
+
+describe('handleDonationVaultEvent handler branches (#316)', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.mocked(dispatchNotification).mockClear();
+    await resetDb();
+  });
+
+  async function seedStream(onChainId: bigint, balance: string, withdrawn = '0') {
+    const donorRow = await prisma.donor.create({ data: { address: fakeAddress('D') } });
+    const ngoRow = await prisma.ngo.create({
+      data: { ownerAddress: fakeAddress('E'), name: 'NGO E' },
+    });
+    await prisma.stream.create({
+      data: {
+        onChainId,
+        donorId: donorRow.id,
+        ngoId: ngoRow.id,
+        tokenAddress: fakeAddress('F'),
+        rate: '10',
+        balance,
+        withdrawn,
+      },
+    });
+  }
+
+  const clampWarnings = (warn: ReturnType<typeof vi.spyOn>) =>
+    warn.mock.calls.filter(([, message]) => message === 'withdraw exceeds recorded stream balance');
+
+  describe('withdraw clamp', () => {
+    it('does not warn on an ordinary withdraw that leaves a positive balance', async () => {
+      const warn = vi.spyOn(logger, 'warn');
+      await seedStream(70n, '1000');
+
+      await handleDonationVaultEvent(
+        makeEvent([symbolScVal('withdraw'), u64ScVal(70n)], i128ScVal(400n)),
+      );
+
+      expect(clampWarnings(warn)).toHaveLength(0);
+      const stream = await prisma.stream.findUnique({ where: { onChainId: 70n } });
+      expect(stream?.balance).toBe('600');
+    });
+
+    it('does not warn when a withdraw drains the balance to exactly zero', async () => {
+      const warn = vi.spyOn(logger, 'warn');
+      await seedStream(71n, '500');
+
+      await handleDonationVaultEvent(
+        makeEvent([symbolScVal('withdraw'), u64ScVal(71n)], i128ScVal(500n)),
+      );
+
+      expect(clampWarnings(warn)).toHaveLength(0);
+      const stream = await prisma.stream.findUnique({ where: { onChainId: 71n } });
+      expect(stream?.balance).toBe('0');
+      expect(stream?.withdrawn).toBe('500');
+    });
+
+    it('warns once on a clamp and still records the event and notification with the raw amount', async () => {
+      const warn = vi.spyOn(logger, 'warn');
+      await seedStream(72n, '400', '100');
+      const event = makeEvent([symbolScVal('withdraw'), u64ScVal(72n)], i128ScVal(500n));
+
+      await handleDonationVaultEvent(event);
+
+      expect(clampWarnings(warn)).toEqual([
+        [
+          { onChainId: '72', balance: '400', accrued: '500' },
+          'withdraw exceeds recorded stream balance',
+        ],
+      ]);
+
+      // The clamp only floors the balance; the audit trail keeps the real amount.
+      const streamEvent = await prisma.streamEvent.findFirst({ where: { streamId: 72n } });
+      expect(streamEvent?.type).toBe('withdraw');
+      expect(streamEvent?.payload).toMatchObject({ accrued: '500' });
+      expect(dispatchNotification).toHaveBeenCalledWith({
+        type: 'stream_withdrawn',
+        eventId: event.id,
+        streamId: '72',
+        amount: '500',
+      });
+    });
+  });
+
+  describe('cancel for an NGO that never registered', () => {
+    const createdEvent = (onChainId: bigint, donor: string, ngo: string) =>
+      makeEvent(
+        [symbolScVal('created'), u64ScVal(onChainId)],
+        xdr.ScVal.scvVec([
+          addressScVal(donor),
+          addressScVal(ngo),
+          addressScVal(fakeAddress('T')),
+          i128ScVal(1000n),
+          i128ScVal(10n),
+        ]),
+      );
+
+    it('keeps the placeholder NGO (empty name, unverified) when its stream is cancelled', async () => {
+      const donor = fakeAddress('P');
+      const ngo = fakeAddress('Q');
+      await handleDonationVaultEvent(createdEvent(80n, donor, ngo));
+
+      const before = await prisma.ngo.findUniqueOrThrow({ where: { ownerAddress: ngo } });
+      expect(before.name).toBe('');
+      expect(before.verified).toBe(false);
+
+      const cancel = makeEvent(
+        [symbolScVal('cancel'), u64ScVal(80n)],
+        xdr.ScVal.scvVec([i128ScVal(300n), i128ScVal(700n)]),
+      );
+      await handleDonationVaultEvent(cancel);
+
+      const stream = await prisma.stream.findUniqueOrThrow({ where: { onChainId: 80n } });
+      expect(stream.status).toBe('CANCELLED');
+      expect(stream.ngoId).toBe(before.id);
+
+      const after = await prisma.ngo.findUniqueOrThrow({ where: { ownerAddress: ngo } });
+      expect(after.id).toBe(before.id);
+      expect(after.name).toBe('');
+      expect(after.verified).toBe(false);
+      expect(await prisma.ngo.count()).toBe(1);
+
+      expect(dispatchNotification).toHaveBeenCalledWith({
+        type: 'stream_cancelled',
+        eventId: cancel.id,
+        streamId: '80',
+        settledToNgo: '300',
+        refundToDonor: '700',
+      });
+    });
+
+    it('does not invent an NGO or donor when the cancelled stream is unknown', async () => {
+      const event = makeEvent(
+        [symbolScVal('cancel'), u64ScVal(81n)],
+        xdr.ScVal.scvVec([i128ScVal(300n), i128ScVal(700n)]),
+      );
+
+      await handleDonationVaultEvent(event);
+
+      expect(await prisma.ngo.count()).toBe(0);
+      expect(await prisma.donor.count()).toBe(0);
+      expect(dispatchNotification).not.toHaveBeenCalled();
+    });
   });
 });

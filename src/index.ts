@@ -47,7 +47,6 @@ app.listen({ port, host: '0.0.0.0' }).catch((err) => {
   process.exit(1);
 });
 
-
 // SIGTERM is what Docker/Kubernetes send on `docker stop`/pod termination;
 // SIGINT is Ctrl+C locally. Without this, both just kill the process
 // mid-request instead of finishing in-flight work and closing the DB pool.
@@ -68,46 +67,3 @@ process.on('SIGINT', () => {
       process.exit(1);
     });
 });
-const gracefulShutdown = async (signal: string) => {
-    if (isShuttingDown) return;
-    isShuttingDown = true;
-    console.log(`\nReceived ${signal}. Starting graceful shutdown...`);
-
-    // Safety timeout to prevent hanging indefinitely (e.g., 10 seconds)
-    const timeout = setTimeout(() => {
-      console.error('Shutdown timed out, forcing exit.');
-      process.exit(1);
-    }, 10000);
-
-    try {
-      // 1. Await indexer stop (finishes in-flight poll)
-      if (indexerService && typeof indexerService.stopIndexer === 'function') {
-        console.log('Stopping indexer...');
-        await indexerService.stopIndexer();
-      }
-
-      // 2. Close NestJS application / HTTP server
-      console.log('Closing HTTP server...');
-      await app.close();
-
-      // 3. Disconnect Prisma
-      if (prismaService && typeof prismaService.$disconnect === 'function') {
-        console.log('Disconnecting database (Prisma)...');
-        await prismaService.$disconnect();
-      }
-
-      clearTimeout(timeout);
-      console.log('Graceful shutdown completed successfully.');
-      process.exit(0);
-    } catch (error) {
-      console.error('Error during graceful shutdown:', error);
-      clearTimeout(timeout);
-      process.exit(1);
-    }
-  };
-
-  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-}
-
-bootstrap();

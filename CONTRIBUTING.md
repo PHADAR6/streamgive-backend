@@ -49,7 +49,8 @@ docker compose up --build
 ## Running the test suite
 
 The integration tests run against a separate `streamgive_test` database that is
-spun up automatically by the Docker Compose file above.
+created automatically by the Docker Compose `postgres` service (the same
+`docker compose up -d postgres` command from the local setup above).
 
 ```bash
 cp .env.test.example .env.test

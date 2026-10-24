@@ -75,6 +75,50 @@ describe('GET /v1/donors', () => {
     await app.close();
   });
 
+  it('uses a different ETag when a query string changes the representation', async () => {
+    const app = buildServer();
+    const ngo = await prisma.ngo.create({
+      data: { ownerAddress: fakeAddress('N'), name: 'NGO', verified: true },
+    });
+    const [highBalance, highWithdrawn] = await Promise.all([
+      prisma.donor.create({ data: { address: fakeAddress('A') } }),
+      prisma.donor.create({ data: { address: fakeAddress('B') } }),
+    ]);
+
+    await prisma.stream.createMany({
+      data: [
+        {
+          onChainId: 1n,
+          donorId: highBalance.id,
+          ngoId: ngo.id,
+          tokenAddress: fakeAddress('T'),
+          rate: '1',
+          balance: '900',
+          withdrawn: '100',
+        },
+        {
+          onChainId: 2n,
+          donorId: highWithdrawn.id,
+          ngoId: ngo.id,
+          tokenAddress: fakeAddress('T'),
+          rate: '1',
+          balance: '100',
+          withdrawn: '900',
+        },
+      ],
+    });
+
+    const committed = await app.inject({ method: 'GET', url: '/v1/donors?sort=committed' });
+    const withdrawn = await app.inject({ method: 'GET', url: '/v1/donors?sort=withdrawn' });
+
+    expect(committed.statusCode).toBe(200);
+    expect(withdrawn.statusCode).toBe(200);
+    expect(committed.body).not.toBe(withdrawn.body);
+    expect(committed.headers.etag).not.toBe(withdrawn.headers.etag);
+
+    await app.close();
+  });
+
   it('sorts by withdrawn amount and paginates the ranked result', async () => {
     const app = buildServer();
     const ngo = await prisma.ngo.create({
@@ -263,6 +307,108 @@ describe('GET /v1/donors/:address', () => {
   it('returns 400 for a malformed address', async () => {
     const app = buildServer();
     const response = await app.inject({ method: 'GET', url: '/v1/donors/not-an-address' });
+    expect(response.statusCode).toBe(400);
+    await app.close();
+  });
+});
+
+describe('GET /v1/donors/:address/streams.csv', () => {
+  afterEach(async () => {
+    await resetDb();
+  });
+
+  it('exports an empty history with headers when donor has no streams', async () => {
+    const app = buildServer();
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/donors/${donor.address}/streams.csv`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toBe('text/csv; charset=utf-8');
+    expect(response.headers['content-disposition']).toBe(
+      `attachment; filename="donor-${donor.address}-streams.csv"`,
+    );
+
+    const body = response.body.trim();
+    expect(body).toBe(
+      'id,onChainId,ngoId,ngoName,ngoAddress,tokenAddress,rate,lastRate,balance,withdrawn,status,createdTxHash,createdAt,updatedAt',
+    );
+
+    await app.close();
+  });
+
+  it('escapes formula injection characters and special CSV characters', async () => {
+    const app = buildServer();
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('B') } });
+    const ngo = await prisma.ngo.create({
+      data: {
+        ownerAddress: fakeAddress('N'),
+        name: '=SUM(A1:A10)',
+        displayName: '@Malicious NGO, "Quoted"',
+        verified: true,
+      },
+    });
+
+    await prisma.stream.create({
+      data: {
+        onChainId: 100n,
+        donorId: donor.id,
+        ngoId: ngo.id,
+        tokenAddress: fakeAddress('T'),
+        rate: '+10',
+        lastRate: '-5',
+        balance: '500',
+        withdrawn: '100',
+        status: 'ACTIVE',
+        createdTxHash: '=cmd|calc',
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/donors/${donor.address}/streams.csv`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toBe('text/csv; charset=utf-8');
+
+    const lines = response.body.trim().split(/\r\n|\n/);
+    expect(lines).toHaveLength(2);
+
+    const row = lines[1];
+    // Formula characters prefix check:
+    // displayName started with '@' and contained quotes/commas -> should be escaped and quoted
+    expect(row).toContain('"\'@Malicious NGO, ""Quoted"""');
+    // rate started with '+' -> '+10'
+    expect(row).toContain("'+10");
+    // lastRate started with '-' -> '-5'
+    expect(row).toContain("'-5");
+    // createdTxHash started with '=' -> '=cmd|calc'
+    expect(row).toContain("'=cmd|calc");
+
+    await app.close();
+  });
+
+  it('returns 404 for an unknown donor address', async () => {
+    const app = buildServer();
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/donors/${fakeAddress('Q')}/streams.csv`,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ error: 'not_found' });
+    await app.close();
+  });
+
+  it('returns 400 for a malformed address', async () => {
+    const app = buildServer();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/donors/not-an-address/streams.csv',
+    });
     expect(response.statusCode).toBe(400);
     await app.close();
   });

@@ -1,10 +1,12 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { sep53Hash } from '../../src/middleware/adminAuth.js';
+
 vi.mock('../../src/notifications/service.js', () => ({ notify: vi.fn() }));
 
 import { prisma } from '../../src/db.js';
-import { sep53Hash } from '../../src/middleware/adminAuth.js';
+import { MAX_APPLICATION_LIST_OFFSET } from '../../src/routes/ngoApplications.js';
 import { buildServer } from '../../src/server.js';
 import { notify } from '../../src/notifications/service.js';
 import { fakeAddress, resetDb } from '../helpers/db.js';
@@ -151,6 +153,85 @@ describe('POST /v1/ngo-applications', () => {
     await app.close();
   });
 
+  it('accepts an already-schemed http website without double-prepending', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ngo-applications',
+      payload: await signedApplicationPayload(app, { website: 'http://example.org' }),
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json().website).toBe('http://example.org');
+
+    await app.close();
+  });
+
+  it('rejects a whitespace-only name with 400', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ngo-applications',
+      payload: await signedApplicationPayload(app, { name: '   ' }),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe('invalid_request');
+
+    await app.close();
+  });
+
+  it('rejects a whitespace-only description with 400', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ngo-applications',
+      payload: await signedApplicationPayload(app, { description: '\t\n ' }),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe('invalid_request');
+
+    await app.close();
+  });
+
+  it('rejects a website URL exceeding 2048 characters with 400', async () => {
+    const app = buildServer();
+
+    const oversizedWebsite = 'https://example.org/' + 'a'.repeat(2030);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ngo-applications',
+      payload: await signedApplicationPayload(app, { website: oversizedWebsite }),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe('invalid_request');
+
+    await app.close();
+  });
+
+  it('rejects a contactEmail exceeding 254 characters with 400', async () => {
+    const app = buildServer();
+
+    // Build an email that is just over the 254-character RFC 5321 limit.
+    const localPart = 'a'.repeat(243);
+    const oversizedEmail = `${localPart}@example.com`; // 243 + 1 + 11 = 255 chars
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ngo-applications',
+      payload: await signedApplicationPayload(app, { contactEmail: oversizedEmail }),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe('invalid_request');
+
+    await app.close();
+  });
+
   it('rejects a malformed ownerAddress with 400', async () => {
     const app = buildServer();
 
@@ -224,8 +305,8 @@ describe('POST /v1/ngo-applications', () => {
     // already covered above, and only a genuine overlap exercises the race
     // where both requests read "nothing blocking" before either inserts.
     const [first, second] = await Promise.all([
-      app.inject({ method: 'POST', url: '/ngo-applications', payload: firstPayload }),
-      app.inject({ method: 'POST', url: '/ngo-applications', payload: secondPayload }),
+      app.inject({ method: 'POST', url: '/v1/ngo-applications', payload: firstPayload }),
+      app.inject({ method: 'POST', url: '/v1/ngo-applications', payload: secondPayload }),
     ]);
 
     expect([first.statusCode, second.statusCode].sort((a, b) => a - b)).toEqual([201, 409]);
@@ -249,7 +330,7 @@ describe('GET /v1/ngo-applications/status', () => {
     await resetDb();
   });
 
-  it('returns only status and timestamps for the latest application', async () => {
+  it('returns the review note for the latest reviewed application without exposing submitted details', async () => {
     const app = buildServer();
     const ownerAddress = fakeAddress('S');
 
@@ -257,7 +338,11 @@ describe('GET /v1/ngo-applications/status', () => {
       data: validApplicationPayload({ ownerAddress, status: 'REJECTED' }),
     });
     const latest = await prisma.ngoApplication.create({
-      data: validApplicationPayload({ ownerAddress, status: 'APPROVED' }),
+      data: validApplicationPayload({
+        ownerAddress,
+        status: 'REJECTED',
+        reviewNote: 'Please provide registration documents.',
+      }),
     });
 
     const response = await app.inject({
@@ -267,11 +352,12 @@ describe('GET /v1/ngo-applications/status', () => {
 
     expect(response.statusCode).toBe(200);
     const body = response.json();
-    expect(body.status).toBe('APPROVED');
+    expect(body.status).toBe('REJECTED');
     expect(body.createdAt).toBe(latest.createdAt.toISOString());
     expect(body.updatedAt).toBe(latest.updatedAt.toISOString());
+    expect(body.reviewNote).toBe('Please provide registration documents.');
     // No contact details or other application fields leak out.
-    expect(Object.keys(body).sort()).toEqual(['createdAt', 'status', 'updatedAt']);
+    expect(Object.keys(body).sort()).toEqual(['createdAt', 'reviewNote', 'status', 'updatedAt']);
 
     await app.close();
   });
@@ -340,7 +426,7 @@ describe('admin NGO application review', () => {
     delete process.env.ADMIN_ADDRESS;
 
     try {
-      const response = await app.inject({ method: 'GET', url: '/ngo-applications' });
+      const response = await app.inject({ method: 'GET', url: '/v1/ngo-applications' });
       expect(response.statusCode).toBe(503);
       expect(response.json().error).toBe('admin_auth_not_configured');
     } finally {
@@ -374,13 +460,17 @@ describe('admin NGO application review', () => {
 
   it('rejects a seconds-based timestamp with a clear unit error', async () => {
     const app = buildServer();
-    const headers = signAdminRequest(adminKeypair, 'GET', '/ngo-applications', {
-      timestamp: Math.floor(Date.now() / 1000),
-    });
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const headers = signAdminRequest(
+      adminKeypair,
+      'GET',
+      '/v1/ngo-applications',
+      timestamp,
+    );
 
-    const response = await app.inject({ method: 'GET', url: '/ngo-applications', headers });
+    const response = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
     expect(response.statusCode).toBe(401);
-    expect(response.json().error).toBe('invalid_timestamp_unit');
+    expect(response.json().error).toBe('timestamp_unit_mismatch');
 
     await app.close();
   });
@@ -397,6 +487,64 @@ describe('admin NGO application review', () => {
     expect(replay.json().error).toBe('replayed_signature');
 
     await app.close();
+  });
+
+  // Mirrors the 5-minute clock-skew window documented in ENVIRONMENT.md and
+  // API.md. Not exported from adminAuth.ts, so it's duplicated here rather
+  // than imported.
+  const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+  it('accepts a timestamp exactly at the clock-skew limit in the past', async () => {
+    const app = buildServer();
+    try {
+      vi.useFakeTimers();
+      const timestamp = (Date.now() - MAX_CLOCK_SKEW_MS).toString();
+      const headers = signAdminRequest(adminKeypair, 'GET', '/v1/ngo-applications', timestamp);
+
+      const response = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
+      expect(response.statusCode).toBe(200);
+    } finally {
+      vi.useRealTimers();
+      await app.close();
+    }
+  });
+
+  it('accepts a timestamp exactly at the clock-skew limit in the future', async () => {
+    const app = buildServer();
+    try {
+      vi.useFakeTimers();
+      const timestamp = (Date.now() + MAX_CLOCK_SKEW_MS).toString();
+      const headers = signAdminRequest(adminKeypair, 'GET', '/v1/ngo-applications', timestamp);
+
+      const response = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
+      expect(response.statusCode).toBe(200);
+    } finally {
+      vi.useRealTimers();
+      await app.close();
+    }
+  });
+
+  it('rejects a replay once its timestamp has aged out of the skew window, as stale rather than silently accepted', async () => {
+    const app = buildServer();
+    try {
+      vi.useFakeTimers();
+      const headers = signAdminRequest(adminKeypair, 'GET', '/v1/ngo-applications');
+
+      const first = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
+      expect(first.statusCode).toBe(200);
+
+      // Past the window the cached entry is pruned on the next request, but
+      // the replayed timestamp is by then also outside the skew window, so
+      // it must come back stale rather than slip through as a fresh replay.
+      vi.advanceTimersByTime(MAX_CLOCK_SKEW_MS + 1);
+
+      const replay = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
+      expect(replay.statusCode).toBe(401);
+      expect(replay.json().error).toBe('stale_signature');
+    } finally {
+      vi.useRealTimers();
+      await app.close();
+    }
   });
 
   it('paginates applications while reporting the full total', async () => {
@@ -432,9 +580,13 @@ describe('admin NGO application review', () => {
     const response = await app.inject({ method: 'POST', url, headers, payload: {} });
     expect(response.statusCode).toBe(200);
     expect(response.json().status).toBe('APPROVED');
+    expect(response.json().reviewedBy).toBe(adminKeypair.publicKey());
+    expect(response.json().reviewedAt).toBeTypeOf('string');
 
     const stored = await prisma.ngoApplication.findUnique({ where: { id: application.id } });
     expect(stored?.status).toBe('APPROVED');
+    expect(stored?.reviewedBy).toBe(adminKeypair.publicKey());
+    expect(stored?.reviewedAt).toBeInstanceOf(Date);
     expect(notify).toHaveBeenCalledWith({
       type: 'application_reviewed',
       applicationId: application.id,
@@ -460,6 +612,8 @@ describe('admin NGO application review', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json().status).toBe('REJECTED');
+    expect(response.json().reviewedBy).toBe(adminKeypair.publicKey());
+    expect(response.json().reviewedAt).toBeTypeOf('string');
     expect(notify).toHaveBeenCalledWith({
       type: 'application_reviewed',
       applicationId: application.id,
@@ -690,7 +844,7 @@ describe('GET /ngo-applications status filter', () => {
     const expected = await seedMixedStatuses();
 
     for (const status of ['PENDING', 'APPROVED', 'REJECTED'] as const) {
-      const url = `/ngo-applications?status=${status}`;
+      const url = `/v1/ngo-applications?status=${status}`;
       // The signature covers `${method}:${url}`, query string included, so
       // signing the bare path here would 401 instead of exercising the filter.
       const headers = signAdminRequest(adminKeypair, 'GET', url);
@@ -729,7 +883,7 @@ describe('GET /ngo-applications status filter', () => {
     const app = buildServer();
     const expected = await seedMixedStatuses();
 
-    const url = '/ngo-applications';
+    const url = '/v1/ngo-applications';
     const headers = signAdminRequest(adminKeypair, 'GET', url);
 
     const response = await app.inject({ method: 'GET', url, headers });
@@ -763,7 +917,7 @@ describe('GET /ngo-applications status filter', () => {
     // enum value, which surfaces to the client as a 500 — so this assertion
     // pins a client-error contract, not just a validation detail.
     for (const status of ['DELETED', 'pending']) {
-      const url = `/ngo-applications?status=${status}`;
+      const url = `/v1/ngo-applications?status=${status}`;
       const headers = signAdminRequest(adminKeypair, 'GET', url);
 
       const response = await app.inject({ method: 'GET', url, headers });
@@ -779,7 +933,7 @@ describe('GET /ngo-applications status filter', () => {
     const app = buildServer();
     const expected = await seedMixedStatuses();
 
-    const url = '/ngo-applications?status=PENDING&limit=1&offset=1';
+    const url = '/v1/ngo-applications?status=PENDING&limit=1&offset=1';
     const headers = signAdminRequest(adminKeypair, 'GET', url);
 
     const response = await app.inject({ method: 'GET', url, headers });
@@ -801,6 +955,151 @@ describe('GET /ngo-applications status filter', () => {
     expect(body.total).toBe(2);
     expect(body.limit).toBe(1);
     expect(body.offset).toBe(1);
+
+    await app.close();
+  });
+});
+
+describe('GET /v1/ngo-applications offset bound and stable paging', () => {
+  beforeAll(() => {
+    process.env.ADMIN_ADDRESS = adminKeypair.publicKey();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.mocked(notify).mockClear();
+    await resetDb();
+  });
+
+  async function list(app: ReturnType<typeof buildServer>, query: string) {
+    const url = `/v1/ngo-applications?${query}`;
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    return app.inject({ method: 'GET', url, headers });
+  }
+
+  it('accepts offset 0', async () => {
+    const app = buildServer();
+
+    const response = await list(app, 'offset=0');
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().offset).toBe(0);
+
+    await app.close();
+  });
+
+  it('accepts the maximum offset and returns an empty page past the end', async () => {
+    const app = buildServer();
+    await prisma.ngoApplication.create({ data: validApplicationPayload() });
+
+    const response = await list(app, `offset=${MAX_APPLICATION_LIST_OFFSET}`);
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.offset).toBe(MAX_APPLICATION_LIST_OFFSET);
+    expect(body.applications).toEqual([]);
+    expect(body.total).toBe(1);
+
+    await app.close();
+  });
+
+  it('rejects an offset one above the maximum with 400', async () => {
+    const app = buildServer();
+
+    const response = await list(app, `offset=${MAX_APPLICATION_LIST_OFFSET + 1}`);
+
+    expect(response.statusCode).toBe(400);
+    const body = response.json();
+    expect(body.error).toBe('invalid_request');
+    expect(body.details.fieldErrors.offset).toBeDefined();
+
+    await app.close();
+  });
+
+  it('rejects very large and negative offsets with 400', async () => {
+    const app = buildServer();
+
+    for (const offset of ['2147483648', '9007199254740991', '1e12', '-1']) {
+      const response = await list(app, `offset=${offset}`);
+
+      expect(response.statusCode, `offset=${offset}`).toBe(400);
+      expect(response.json().error).toBe('invalid_request');
+    }
+
+    await app.close();
+  });
+
+  it('does not query the database for a rejected offset', async () => {
+    const app = buildServer();
+    const findMany = vi.spyOn(prisma.ngoApplication, 'findMany');
+    const count = vi.spyOn(prisma.ngoApplication, 'count');
+
+    const response = await list(app, `offset=${MAX_APPLICATION_LIST_OFFSET + 1}`);
+
+    expect(response.statusCode).toBe(400);
+    expect(findMany).not.toHaveBeenCalled();
+    expect(count).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it('breaks createdAt ties by id so offset pages never repeat or skip a row', async () => {
+    const app = buildServer();
+    const sameInstant = new Date('2026-01-01T00:00:00.000Z');
+    await Promise.all(
+      ['A', 'B', 'C', 'D', 'E'].map((suffix) =>
+        prisma.ngoApplication.create({
+          data: validApplicationPayload({
+            ownerAddress: fakeAddress(suffix),
+            createdAt: sameInstant,
+          }),
+        }),
+      ),
+    );
+
+    const seen: string[] = [];
+    for (const offset of [0, 2, 4]) {
+      const response = await list(app, `limit=2&offset=${offset}`);
+      expect(response.statusCode).toBe(200);
+      for (const row of response.json().applications) seen.push(row.id);
+    }
+
+    // Every row exactly once, in a fixed order: id descending.
+    expect(new Set(seen).size).toBe(5);
+    expect(seen).toEqual([...seen].sort().reverse());
+
+    // The same pages requested again return the same rows in the same order.
+    const again: string[] = [];
+    for (const offset of [0, 2, 4]) {
+      const response = await list(app, `limit=2&offset=${offset}`);
+      for (const row of response.json().applications) again.push(row.id);
+    }
+    expect(again).toEqual(seen);
+
+    await app.close();
+  });
+
+  it('still lists newer applications before older ones', async () => {
+    const app = buildServer();
+    const older = await prisma.ngoApplication.create({
+      data: validApplicationPayload({
+        ownerAddress: fakeAddress('A'),
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      }),
+    });
+    const newer = await prisma.ngoApplication.create({
+      data: validApplicationPayload({
+        ownerAddress: fakeAddress('B'),
+        createdAt: new Date('2026-02-01T00:00:00.000Z'),
+      }),
+    });
+
+    const response = await list(app, 'limit=2');
+
+    expect(response.json().applications.map((a: { id: string }) => a.id)).toEqual([
+      newer.id,
+      older.id,
+    ]);
 
     await app.close();
   });

@@ -29,6 +29,7 @@ describe('GET /v1/ngos', () => {
     const body = response.json();
     expect(body.ngos).toHaveLength(1);
     expect(body.ngos[0].name).toBe('Verified NGO');
+    expect(body.ngos.map((ngo: { name: string }) => ngo.name)).not.toContain('Unverified NGO');
     expect(body.nextCursor).toBeNull();
 
     await app.close();
@@ -56,14 +57,14 @@ describe('GET /v1/ngos', () => {
   it('returns an ETag and responds 304 when the client has the current representation', async () => {
     const app = buildServer();
 
-    const firstResponse = await app.inject({ method: 'GET', url: '/ngos' });
+    const firstResponse = await app.inject({ method: 'GET', url: '/v1/ngos' });
     const etag = firstResponse.headers.etag;
     expect(etag).toBeDefined();
     expect(firstResponse.headers['cache-control']).toContain('public');
 
     const cachedResponse = await app.inject({
       method: 'GET',
-      url: '/ngos',
+      url: '/v1/ngos',
       headers: { 'if-none-match': String(etag) },
     });
 
@@ -258,7 +259,7 @@ describe('GET /ngos/all (admin)', () => {
       data: { ownerAddress: fakeAddress('A'), name: 'Verified NGO', verified: true },
     });
 
-    const response = await app.inject({ method: 'GET', url: '/ngos/all' });
+    const response = await app.inject({ method: 'GET', url: '/v1/ngos/all' });
     expect(response.statusCode).toBe(401);
 
     await app.close();
@@ -274,8 +275,8 @@ describe('GET /ngos/all (admin)', () => {
       data: { ownerAddress: fakeAddress('B'), name: 'Verified NGO', verified: true },
     });
 
-    const headers = signAdminRequest(adminKeypair, 'GET', '/ngos/all');
-    const response = await app.inject({ method: 'GET', url: '/ngos/all', headers });
+    const headers = signAdminRequest(adminKeypair, 'GET', '/v1/ngos/all');
+    const response = await app.inject({ method: 'GET', url: '/v1/ngos/all', headers });
     expect(response.statusCode).toBe(200);
 
     const body = response.json();
@@ -299,7 +300,7 @@ describe('GET /ngos/all (admin)', () => {
       data: { ownerAddress: fakeAddress('B'), name: 'Verified NGO', verified: true },
     });
 
-    const url = '/ngos/all?verified=false';
+    const url = '/v1/ngos/all?verified=false';
     const headers = signAdminRequest(adminKeypair, 'GET', url);
     const response = await app.inject({ method: 'GET', url, headers });
     expect(response.statusCode).toBe(200);
@@ -322,7 +323,7 @@ describe('GET /ngos/all (admin)', () => {
       data: { ownerAddress: fakeAddress('B'), name: 'Verified NGO', verified: true },
     });
 
-    const url = '/ngos/all?verified=true';
+    const url = '/v1/ngos/all?verified=true';
     const headers = signAdminRequest(adminKeypair, 'GET', url);
     const response = await app.inject({ method: 'GET', url, headers });
     expect(response.statusCode).toBe(200);
@@ -338,7 +339,7 @@ describe('GET /ngos/all (admin)', () => {
   it('400s on an invalid verified value', async () => {
     const app = buildServer();
 
-    const url = '/ngos/all?verified=maybe';
+    const url = '/v1/ngos/all?verified=maybe';
     const headers = signAdminRequest(adminKeypair, 'GET', url);
     const response = await app.inject({ method: 'GET', url, headers });
     expect(response.statusCode).toBe(400);
@@ -356,7 +357,7 @@ describe('GET /ngos/all (admin)', () => {
       });
     }
 
-    const firstUrl = '/ngos/all?limit=2';
+    const firstUrl = '/v1/ngos/all?limit=2';
     const firstHeaders = signAdminRequest(adminKeypair, 'GET', firstUrl);
     const firstPage = await app.inject({ method: 'GET', url: firstUrl, headers: firstHeaders });
     expect(firstPage.statusCode).toBe(200);
@@ -366,7 +367,7 @@ describe('GET /ngos/all (admin)', () => {
     expect(firstBody.nextCursor).not.toBeNull();
     const firstIds = firstBody.ngos.map((n: { id: string }) => n.id);
 
-    const secondUrl = `/ngos/all?limit=2&cursor=${firstBody.nextCursor}`;
+    const secondUrl = `/v1/ngos/all?limit=2&cursor=${firstBody.nextCursor}`;
     const secondHeaders = signAdminRequest(adminKeypair, 'GET', secondUrl);
     const secondPage = await app.inject({ method: 'GET', url: secondUrl, headers: secondHeaders });
     expect(secondPage.statusCode).toBe(200);
@@ -409,6 +410,31 @@ describe('GET /ngos/lookup', () => {
     const body = response.json();
     expect(body.id).toBe(ngo.id);
     expect(body.name).toBe('Community Impact');
+
+    await app.close();
+  });
+
+  it('returns an unverified NGO matching the given address', async () => {
+    const app = buildServer();
+
+    const ngo = await prisma.ngo.create({
+      data: {
+        ownerAddress: fakeAddress('A'),
+        name: 'Unverified Impact NGO',
+        verified: false,
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/ngos/lookup?address=${ngo.ownerAddress}`,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: ngo.id,
+      ownerAddress: ngo.ownerAddress,
+      verified: false,
+    });
 
     await app.close();
   });
@@ -457,6 +483,28 @@ describe('GET /v1/ngos/:id', () => {
 
     const response = await app.inject({ method: 'GET', url: '/v1/ngos/not-a-uuid' });
     expect(response.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('returns an unverified NGO by id', async () => {
+    const app = buildServer();
+
+    const ngo = await prisma.ngo.create({
+      data: {
+        ownerAddress: fakeAddress('C'),
+        name: 'Unverified Impact NGO',
+        verified: false,
+      },
+    });
+
+    const response = await app.inject({ method: 'GET', url: `/v1/ngos/${ngo.id}` });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: ngo.id,
+      ownerAddress: ngo.ownerAddress,
+      verified: false,
+    });
 
     await app.close();
   });
@@ -576,7 +624,7 @@ describe('GET /v1/ngos/:id', () => {
       })),
     });
 
-    const response = await app.inject({ method: 'GET', url: `/ngos/${ngo.id}` });
+    const response = await app.inject({ method: 'GET', url: `/v1/ngos/${ngo.id}` });
     expect(response.statusCode).toBe(200);
 
     const body = response.json();
@@ -811,7 +859,7 @@ describe('GET /v1/ngos/:id/donors', () => {
       },
     });
 
-    const unknownCursor = '00000000-0000-0000-0000-000000000099';
+    const unknownCursor = 'ffffffff-ffff-4fff-bfff-ffffffffffff';
     const response = await app.inject({
       method: 'GET',
       url: `/v1/ngos/${ngo.id}/donors?cursor=${unknownCursor}`,

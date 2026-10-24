@@ -1,7 +1,14 @@
+import { createHash } from 'node:crypto';
+
 import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
 
 import { sendPublicCacheable } from '../src/routes/cacheable.js';
+
+/** The validator the helper is expected to produce for a given body. */
+function expectedEtag(body: string): string {
+  return `"${createHash('sha256').update(body).digest('base64url')}"`;
+}
 
 describe('public conditional responses', () => {
   it('returns an ETag and answers a matching If-None-Match with 304', async () => {
@@ -13,6 +20,7 @@ describe('public conditional responses', () => {
     const firstResponse = await app.inject({ method: 'GET', url: '/public' });
     const etag = firstResponse.headers.etag;
     expect(etag).toBeDefined();
+    expect(etag).toBe(expectedEtag(JSON.stringify({ value: 'current' })));
     expect(firstResponse.headers['cache-control']).toContain('public');
 
     const cachedResponse = await app.inject({

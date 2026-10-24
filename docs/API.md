@@ -28,7 +28,65 @@ seconds.
 
 Routes marked **Public** do not require authentication. Public directory,
 stream, and impact endpoints may return `304 Not Modified` when the
-`If-None-Match` header matches their ETag.
+`If-None-Match` header matches their ETag. See [Caching and conditional requests](#caching-and-conditional-requests).
+
+Unknown routes return `404` with the same body used by every other missing
+resource: `{"error":"not_found"}`.
+
+## Caching and conditional requests
+
+Eleven public read endpoints send a validator and a short shared-cache
+lifetime. Everything else is uncached.
+
+| Method and path | Cacheable |
+|---|---|
+| `GET /v1/ngos` | Yes |
+| `GET /v1/ngos/lookup` | Yes |
+| `GET /v1/ngos/{id}` | Yes |
+| `GET /v1/ngos/{id}/donors` | Yes |
+| `GET /v1/donors` | Yes |
+| `GET /v1/donors/{address}` | Yes |
+| `GET /v1/streams` | Yes |
+| `GET /v1/streams/{id}` | Yes |
+| `GET /v1/streams/{id}/activity` | Yes |
+| `GET /v1/impact` | Yes |
+| `GET /v1/impact/{ngoId}` | Yes |
+
+Not cacheable: `GET /v1/ngos/all`, `GET /v1/ngo-applications*`, the admin
+routes, `GET /v1/donors/{address}/streams.csv`, `GET /v1/indexer/status`,
+`GET /health`, `GET /health/ready`, and `GET /metrics`.
+
+### Headers
+
+A cacheable response carries:
+
+```
+Cache-Control: public, max-age=30, stale-while-revalidate=60
+ETag: "<base64url SHA-256 of the response body>"
+```
+
+The ETag is computed over the exact JSON bytes sent, so it changes whenever
+the body changes. Responses are not personalised, so a shared cache may store
+them for 30 seconds and serve a stale copy for up to a further 60 seconds
+while it revalidates.
+
+### Conditional requests
+
+Send the ETag back in `If-None-Match` to get a body-less `304 Not Modified`
+while the resource is unchanged:
+
+```
+GET /v1/ngos/{id} HTTP/1.1
+If-None-Match: "3f2a…"
+
+HTTP/1.1 304 Not Modified
+Cache-Control: public, max-age=30, stale-while-revalidate=60
+ETag: "3f2a…"
+```
+
+`If-None-Match` accepts a comma-separated list of ETags, weak validators
+(`W/"…"`, compared as strong), and `*`. A request whose validator no longer
+matches receives the full `200` response with the new ETag.
 
 ## Integer and amount representation
 
@@ -82,8 +140,14 @@ unavailable.
 
 ### `GET /metrics`
 
-**Auth:** Public  
+**Auth:** Public, or bearer token when `METRICS_TOKEN` is set
+
 **Params:** None.
+
+If the server has `METRICS_TOKEN` set, this endpoint requires
+`Authorization: Bearer <token>`. A missing or wrong token returns
+`401 { "error": "unauthorized" }`. When `METRICS_TOKEN` is unset, the
+endpoint is public.
 
 Returns Prometheus exposition text (`text/plain; version=0.0.4`), including
 HTTP request and duration metrics, indexer checkpoint and lag, and webhook
@@ -119,12 +183,12 @@ streamgive_notification_deliveries_total{outcome="failure"} 0
 **Auth:** Public  
 **Query params:**
 
-| Name | Type | Default | Description |
-| --- | --- | --- | --- |
-| `limit` | integer, 1–100 | `100` | Maximum results. |
-| `cursor` | UUID | — | Continue after this NGO ID. |
-| `sort` | `newest`, `oldest`, `name` | `newest` | Result ordering. |
-| `q` | string, up to 100 characters | — | Case-insensitive substring search on the public name. |
+| Name     | Type                         | Default  | Description                                           |
+| -------- | ---------------------------- | -------- | ----------------------------------------------------- |
+| `limit`  | integer, 1–100               | `100`    | Maximum results.                                      |
+| `cursor` | UUID                         | —        | Continue after this NGO ID.                           |
+| `sort`   | `newest`, `oldest`, `name`   | `newest` | Result ordering.                                      |
+| `q`      | string, up to 100 characters | —        | Case-insensitive substring search on the public name. |
 
 Lists verified NGOs. `nextCursor` is the last returned NGO ID when another
 page is available, otherwise `null`.
@@ -151,11 +215,11 @@ page is available, otherwise `null`.
 **Auth:** Admin signature  
 **Query params:**
 
-| Name | Type | Default | Description |
-| --- | --- | --- | --- |
-| `limit` | integer, 1–100 | `100` | Maximum results. |
-| `cursor` | UUID | — | Continue after this NGO ID. |
-| `verified` | `true` or `false` | — | Filter by verification status. |
+| Name       | Type              | Default | Description                    |
+| ---------- | ----------------- | ------- | ------------------------------ |
+| `limit`    | integer, 1–100    | `100`   | Maximum results.               |
+| `cursor`   | UUID              | —       | Continue after this NGO ID.    |
+| `verified` | `true` or `false` | —       | Filter by verification status. |
 
 Lists verified and unverified NGOs.
 
@@ -182,7 +246,12 @@ Lists verified and unverified NGOs.
 **Query params:** `address` (required): Stellar public key (`G` followed by
 55 base32 characters).
 
-Looks up an NGO profile by its owner address. Returns `400
+Looks up an NGO profile by its owner address. This endpoint is public and
+returns a profile whether or not the NGO is verified. This intentionally
+differs from `GET /v1/ngos`, which lists verified NGOs only. For an unverified
+or placeholder NGO, `verified` is `false`; `name` and approved-application
+fields (`description`, `website`, and `country`) can be `null`. The lookup
+does not expose pending application details. Returns `400
 {"error":"invalid_request"}` for an invalid address and `404
 {"error":"not_found"}` if there is no matching NGO. The response has the same
 shape as `GET /v1/ngos/{id}`; see that endpoint's example response.
@@ -192,7 +261,13 @@ shape as `GET /v1/ngos/{id}`; see that endpoint's example response.
 **Auth:** Public  
 **Path params:** `id` (required): NGO UUID.
 
-Returns an NGO profile, impact totals, and up to ten recent streams. Returns
+Returns an NGO profile, impact totals, and up to ten recent streams for
+verified, unverified, and placeholder NGOs. This public ID lookup is not a
+verification check: callers must inspect `verified` before treating an NGO as
+approved. Placeholder records can have `registered: false` and `name: null`;
+unverified records can have `verified: false` and `null` approved-application
+fields (`description`, `website`, and `country`). Pending application details
+remain private. Returns
 `400 {"error":"invalid_request"}` for an invalid ID or
 `404 {"error":"not_found"}` if no NGO exists.
 
@@ -211,9 +286,7 @@ Returns an NGO profile, impact totals, and up to ten recent streams. Returns
   "country": "Example",
   "stats": {
     "totalCommitted": "12000",
-    "committedByToken": [
-      { "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "12000" }
-    ],
+    "committedByToken": [{ "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "12000" }],
     "totalWithdrawn": "2000",
     "activeStreamCount": 2,
     "donorCount": 3
@@ -260,9 +333,7 @@ max-age; send `If-None-Match` to receive `304 Not Modified` when unchanged.
       "id": "<UUID>",
       "address": "<STELLAR_PUBLIC_KEY>",
       "totalCommitted": "1200",
-      "committedByToken": [
-        { "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "1200" }
-      ]
+      "committedByToken": [{ "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "1200" }]
     }
   ],
   "nextCursor": null
@@ -299,12 +370,12 @@ set to the display name when present, otherwise its registered name. Returns
 **Auth:** Public  
 **Query params:**
 
-| Name | Type | Default | Description |
-| --- | --- | --- | --- |
-| `sort` | `committed` or `withdrawn` | `committed` | Amount used to rank donors. |
-| `order` | `asc` or `desc` | `desc` | Sort direction. |
-| `limit` | integer, 1–100 | `100` | Maximum results. |
-| `cursor` | UUID | — | Continue after this donor ID. |
+| Name     | Type                       | Default     | Description                   |
+| -------- | -------------------------- | ----------- | ----------------------------- |
+| `sort`   | `committed` or `withdrawn` | `committed` | Amount used to rank donors.   |
+| `order`  | `asc` or `desc`            | `desc`      | Sort direction.               |
+| `limit`  | integer, 1–100             | `100`       | Maximum results.              |
+| `cursor` | UUID                       | —           | Continue after this donor ID. |
 
 Returns donor totals across all streams.
 Each donor includes `committedByToken`, an array of `{ tokenAddress, amount }`
@@ -321,9 +392,7 @@ max-age; send `If-None-Match` to receive `304 Not Modified` when unchanged.
       "address": "<STELLAR_PUBLIC_KEY>",
       "createdAt": "<ISO-8601>",
       "totalCommitted": "1200",
-      "committedByToken": [
-        { "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "1200" }
-      ],
+      "committedByToken": [{ "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "1200" }],
       "totalWithdrawn": "200"
     }
   ],
@@ -354,9 +423,7 @@ Returns `400 {"error":"invalid_request"}` for an invalid address and
   "address": "<STELLAR_PUBLIC_KEY>",
   "createdAt": "<ISO-8601>",
   "totalCommitted": "1200",
-  "committedByToken": [
-    { "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "1200" }
-  ],
+  "committedByToken": [{ "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "1200" }],
   "totalWithdrawn": "200",
   "activeStreamCount": 2,
   "distinctNgoCount": 1
@@ -370,15 +437,15 @@ Returns `400 {"error":"invalid_request"}` for an invalid address and
 **Auth:** Public  
 **Query params:**
 
-| Name | Type | Default | Description |
-| --- | --- | --- | --- |
-| `donor` | Stellar public key | — | Filter by donor address. |
-| `ngo` | UUID | — | Filter by NGO ID. |
-| `ngoAddress` | Stellar public key | — | Filter by NGO owner address. |
-| `token` | Stellar contract address | — | Filter by token contract. |
-| `status` | `ACTIVE` or `CANCELLED` | — | Filter by stream status. |
-| `limit` | integer, 1–100 | `100` | Maximum results. |
-| `cursor` | UUID | — | Continue after this stream ID. |
+| Name         | Type                     | Default | Description                    |
+| ------------ | ------------------------ | ------- | ------------------------------ |
+| `donor`      | Stellar public key       | —       | Filter by donor address.       |
+| `ngo`        | UUID                     | —       | Filter by NGO ID.              |
+| `ngoAddress` | Stellar public key       | —       | Filter by NGO owner address.   |
+| `token`      | Stellar contract address | —       | Filter by token contract.      |
+| `status`     | `ACTIVE` or `CANCELLED`  | —       | Filter by stream status.       |
+| `limit`      | integer, 1–100           | `100`   | Maximum results.               |
+| `cursor`     | UUID                     | —       | Continue after this stream ID. |
 
 Returns streams newest first. On-chain integer values are serialized as
 decimal strings.
@@ -479,9 +546,7 @@ token's committed amount.
 ```json
 {
   "totalCommitted": "12000",
-  "committedByToken": [
-    { "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "12000" }
-  ],
+  "committedByToken": [{ "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "12000" }],
   "totalWithdrawn": "2000",
   "activeStreams": 4,
   "verifiedNgoCount": 3
@@ -503,12 +568,8 @@ platform committed amounts per token. Returns `400 {"error":"invalid_request"}` 
   "ngoId": "<UUID>",
   "name": "Example Aid",
   "totalCommitted": "5000",
-  "committedByToken": [
-    { "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "5000" }
-  ],
-  "platformCommittedByToken": [
-    { "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "12000" }
-  ],
+  "committedByToken": [{ "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "5000" }],
+  "platformCommittedByToken": [{ "tokenAddress": "<STELLAR_CONTRACT_ADDRESS>", "amount": "12000" }],
   "totalWithdrawn": "1200",
   "activeStreams": 2,
   "cancelledStreams": 1,
@@ -534,16 +595,16 @@ The response contains `challenge`, `message`, and `expiresAt`.
 **Auth:** Public  
 **JSON body:**
 
-| Name | Type | Required | Description |
-| --- | --- | --- | --- |
-| `ownerAddress` | Stellar public key | Yes | Applicant's wallet address. |
-| `name` | string, 1–200 characters | Yes | Organization name. |
-| `description` | string, 1–5000 characters | Yes | Organization description. |
-| `contactEmail` | email string | Yes | Contact email. |
-| `website` | URL string | No | Website; a missing scheme is normalized to `https://`. |
-| `country` | string, up to 100 characters | No | Country. |
-| `challenge` | UUID | Yes | Unexpired challenge issued for this owner address. |
-| `signature` | string | Yes | SEP-53 signature of the issued challenge `message`. |
+| Name           | Type                         | Required | Description                                            |
+| -------------- | ---------------------------- | -------- | ------------------------------------------------------ |
+| `ownerAddress` | Stellar public key           | Yes      | Applicant's wallet address.                            |
+| `name`         | string, 1–200 characters     | Yes      | Organization name.                                     |
+| `description`  | string, 1–5000 characters    | Yes      | Organization description.                              |
+| `contactEmail` | email string                 | Yes      | Contact email.                                         |
+| `website`      | URL string                   | No       | Website; a missing scheme is normalized to `https://`. |
+| `country`      | string, up to 100 characters | No       | Country.                                               |
+| `challenge`    | UUID                         | Yes      | Unexpired challenge issued for this owner address.     |
+| `signature`    | string                       | Yes      | SEP-53 signature of the issued challenge `message`.    |
 
 Create a challenge first, then include its `challenge` and a signature of its
 exact `message` in the application body. A challenge can be used only once.
@@ -608,10 +669,12 @@ Returns counts grouped by application status.
 
 **Auth:** Admin signature  
 **Query params:** `status` (`PENDING`, `APPROVED`, or `REJECTED`, optional),
-`limit` (integer, 1–100, default `100`), and `offset` (integer, minimum `0`,
-default `0`).
+`limit` (integer, 1–100, default `100`), and `offset` (integer, 0–10000,
+default `0`). An `offset` above 10000 returns `400 invalid_request`.
 
 Returns application records and the total count matching the optional status.
+Records are ordered newest first, with `id` (descending) as a tie-breaker so
+pages are stable when several applications share a creation time.
 
 ```json
 {
@@ -692,6 +755,41 @@ available.
   "updatedAt": "<ISO-8601>",
   "latestLedger": 123455,
   "ledgerLag": 5
+}
+```
+
+### `GET /v1/admin/dead-letters`
+
+**Auth:** Admin signature  
+**Query params:**
+
+- `limit` (optional integer, 1–100, default 100): maximum items to return.
+- `cursor` (optional UUID): ID of the last item from the previous page for keyset pagination.
+- `resolved` (optional string, `true` or `false`): filter by resolution status (`resolvedAt != null` vs `resolvedAt == null`). Omit to return both.
+
+Returns paginated records of failed contract events recorded in `indexer_dead_letters`. Returns `400 {"error":"invalid_request"}` for invalid query parameters, `200` with an empty page and the matching filtered `total` for a well-formed cursor UUID that is not present, and `401 {"error":"unauthorized"}` for missing or invalid admin signatures. Pagination uses the ordered `(createdAt, id)` tuple as its boundary, including when multiple records share a timestamp.
+
+```json
+{
+  "deadLetters": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "eventId": "0000123450-0000000001",
+      "ledger": 123450,
+      "contractId": "CCPWQBI7FV2CZ7EECOVZ5XHOHK5S7CS6XTBDWPWHBEOKPTIASNGOBQFH",
+      "error": "TypeError: Cannot read properties of undefined",
+      "topic": ["AAAA..."],
+      "value": "AAAA...",
+      "txHash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      "attempts": 1,
+      "resolvedAt": null,
+      "createdAt": "2026-10-21T05:00:00.000Z",
+      "updatedAt": "2026-10-21T05:00:00.000Z"
+    }
+  ],
+  "total": 1,
+  "hasMore": false,
+  "nextCursor": null
 }
 ```
 

@@ -138,8 +138,12 @@ export async function impactRoutes(app: FastifyInstance): Promise<void> {
         0n,
       );
 
+      const percentScale = 1_000_000_000_000n;
       const platformSharePercent =
-        platformCommitted > 0n ? Number((ngoCommitted * 10000n) / platformCommitted) / 100 : 0;
+        platformCommitted > 0n
+          ? Number((ngoCommitted * 100n * percentScale) / platformCommitted) /
+            Number(percentScale)
+          : 0;
 
       return sendPublicCacheable(request, reply, {
         ngoId: ngo.id,

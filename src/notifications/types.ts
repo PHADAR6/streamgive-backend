@@ -14,6 +14,7 @@ export type NotificationEvent =
       refundToDonor: string;
       eventId?: string;
     }
+  | { type: 'ngo_registered'; ownerAddress: string; ngoId: string; eventId?: string }
   | { type: 'ngo_approved'; ownerAddress: string; ngoId: string; eventId?: string }
   | { type: 'ngo_revoked'; ownerAddress: string; ngoId: string; eventId?: string }
   | {

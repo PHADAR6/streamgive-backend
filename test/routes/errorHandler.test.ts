@@ -83,7 +83,7 @@ describe('Global Error Handler', () => {
     await app.close();
   });
 
-  it('returns 404 for unknown routes with Fastify default error shape', async () => {
+  it('returns the standard error body for unknown routes', async () => {
     const app = buildServer();
 
     const response = await app.inject({
@@ -92,11 +92,21 @@ describe('Global Error Handler', () => {
     });
 
     expect(response.statusCode).toBe(404);
-    const body = response.json();
-    // Fastify's default 404 handler returns a different shape than our custom error handler
-    expect(body.statusCode).toBe(404);
-    expect(body.error).toBe('Not Found');
-    expect(body.message).toBe('Route GET:/this-route-does-not-exist not found');
+    expect(response.json()).toEqual({ error: 'not_found' });
+
+    await app.close();
+  });
+
+  it('returns the standard error body for an unknown path under /v1', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/this-route-does-not-exist',
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ error: 'not_found' });
 
     await app.close();
   });

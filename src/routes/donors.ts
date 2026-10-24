@@ -166,4 +166,103 @@ export async function donorRoutes(app: FastifyInstance): Promise<void> {
       distinctNgoCount: new Set(streams.map((stream) => stream.ngoId)).size,
     });
   });
+
+  /**
+   * Helper to escape a value for CSV with RFC 4180 rules and formula injection protection.
+   */
+  function escapeCsvField(value: unknown): string {
+    if (value === null || value === undefined) {
+      return '';
+    }
+    let str = String(value);
+    // Formula-safe: if string starts with dangerous characters, prefix with single quote
+    if (/^[=+\-@\t\r]/.test(str)) {
+      str = `'${str}`;
+    }
+    // If field contains quotes, commas, or newlines, wrap in quotes and escape internal quotes
+    if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  }
+
+  /**
+   * Exports all streams for a donor as a CSV file with formula-safe fields.
+   * @route GET /v1/donors/:address/streams.csv
+   * @param address Stellar public key
+   * @auth Public
+   * @returns 200 CSV stream; 400 invalid address; 404 `{ error: "not_found" }`.
+   */
+  app.get('/donors/:address/streams.csv', async (request, reply) => {
+    const parsedParams = addressParamSchema.safeParse(request.params);
+    if (!parsedParams.success) {
+      return reply.code(400).send({ error: 'invalid_request' });
+    }
+
+    const donor = await prisma.donor.findUnique({
+      where: { address: parsedParams.data.address },
+    });
+
+    if (!donor) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    const streams = await prisma.stream.findMany({
+      where: { donorId: donor.id },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        ngo: { select: { id: true, name: true, displayName: true, ownerAddress: true } },
+      },
+    });
+
+    const headers = [
+      'id',
+      'onChainId',
+      'ngoId',
+      'ngoName',
+      'ngoAddress',
+      'tokenAddress',
+      'rate',
+      'lastRate',
+      'balance',
+      'withdrawn',
+      'status',
+      'createdTxHash',
+      'createdAt',
+      'updatedAt',
+    ];
+
+    const rows = streams.map((stream) => {
+      const ngoName = stream.ngo.displayName || stream.ngo.name || '';
+      return [
+        stream.id,
+        stream.onChainId.toString(),
+        stream.ngoId,
+        ngoName,
+        stream.ngo.ownerAddress,
+        stream.tokenAddress,
+        stream.rate,
+        stream.lastRate ?? '',
+        stream.balance,
+        stream.withdrawn,
+        stream.status,
+        stream.createdTxHash ?? '',
+        stream.createdAt.toISOString(),
+        stream.updatedAt.toISOString(),
+      ];
+    });
+
+    const csvContent = [
+      headers.map(escapeCsvField).join(','),
+      ...rows.map((row) => row.map(escapeCsvField).join(',')),
+    ].join('\r\n');
+
+    reply.header('content-type', 'text/csv; charset=utf-8');
+    reply.header(
+      'content-disposition',
+      `attachment; filename="donor-${parsedParams.data.address}-streams.csv"`,
+    );
+
+    return reply.send(csvContent ? `${csvContent}\r\n` : '');
+  });
 }

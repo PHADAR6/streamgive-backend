@@ -11,7 +11,7 @@ import type { ContractEvent } from '../worker.js';
  * `register` — emitted when an NGO signs up. Writes: upserts the `ngo` row
  * for the owner address, creating it with `verified: false` or updating its
  * `name` if it already exists. Persists a `StreamEvent` row in the same
- * transaction.
+ * transaction, then emits an `ngo_registered` notification.
  *
  * `approved` — emitted when an admin approves a previously-registered NGO.
  * Writes: sets `verified: true` on the matching `ngo` row via `updateMany`
@@ -51,6 +51,11 @@ export async function handleNgoRegistryEvent(event: ContractEvent): Promise<void
         },
       });
     });
+
+    const ngo = await prisma.ngo.findFirst({ where: { ownerAddress }, select: { id: true } });
+    if (ngo) {
+      dispatchNotification({ type: 'ngo_registered', ownerAddress, ngoId: ngo.id, eventId: event.id });
+    }
     return;
   }
 

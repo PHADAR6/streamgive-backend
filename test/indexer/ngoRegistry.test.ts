@@ -1,12 +1,16 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../../src/notifications/service.js', () => ({ dispatchNotification: vi.fn() }));
 
 import { prisma } from '../../src/db.js';
 import { handleNgoRegistryEvent } from '../../src/indexer/handlers/ngoRegistry.js';
+import { dispatchNotification } from '../../src/notifications/service.js';
 import { fakeAddress, resetDb } from '../helpers/db.js';
 import { addressScVal, makeEvent, stringScVal, symbolScVal } from '../helpers/events.js';
 
 describe('handleNgoRegistryEvent', () => {
   afterEach(async () => {
+    vi.mocked(dispatchNotification).mockClear();
     await resetDb();
   });
 
@@ -27,6 +31,26 @@ describe('handleNgoRegistryEvent', () => {
     expect(streamEvent?.streamId).toBeNull();
     expect(streamEvent?.ledger).toBe(100);
     expect(streamEvent?.payload).toMatchObject({ ownerAddress: owner, name: 'Red Cross' });
+  });
+
+  it('dispatches an ngo_registered notification on a register event', async () => {
+    const owner = fakeAddress('E');
+    const event = makeEvent(
+      [symbolScVal('register'), addressScVal(owner)],
+      stringScVal('Oxfam'),
+    );
+
+    await handleNgoRegistryEvent(event);
+
+    const ngo = await prisma.ngo.findUnique({ where: { ownerAddress: owner } });
+    expect(ngo).not.toBeNull();
+    expect(dispatchNotification).toHaveBeenCalledTimes(1);
+    expect(dispatchNotification).toHaveBeenCalledWith({
+      type: 'ngo_registered',
+      ownerAddress: owner,
+      ngoId: ngo?.id,
+      eventId: event.id,
+    });
   });
 
   it('marks an existing NGO verified on an approved event', async () => {

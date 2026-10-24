@@ -19,7 +19,7 @@ describe('CORS configuration', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: '/v1/health',
+      url: '/metrics',
       headers: {
         origin: 'http://localhost:3001',
       },
@@ -82,7 +82,7 @@ describe('CORS configuration', () => {
 
     const response = await app.inject({
       method: 'OPTIONS',
-      url: '/health',
+      url: '/v1/health',
       headers: {
         origin: 'http://localhost:3001',
         'access-control-request-method': 'PATCH',
@@ -94,6 +94,36 @@ describe('CORS configuration', () => {
       .map((method) => method.trim().toUpperCase());
     expect(response.statusCode).toBe(204);
     expect(methods).toEqual(expect.arrayContaining(['PUT', 'PATCH', 'DELETE']));
+
+    await app.close();
+  });
+
+  it('exposes Retry-After and the rate-limit headers to browser clients', async () => {
+    process.env.CORS_ORIGINS = 'http://localhost:3001';
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/metrics',
+      headers: {
+        origin: 'http://localhost:3001',
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const exposedHeaders = String(response.headers['access-control-expose-headers'])
+      .split(',')
+      .map((header) => header.trim().toLowerCase());
+
+    expect(exposedHeaders).toEqual(
+      expect.arrayContaining([
+        'x-request-id',
+        'retry-after',
+        'x-ratelimit-limit',
+        'x-ratelimit-remaining',
+        'x-ratelimit-reset',
+      ]),
+    );
 
     await app.close();
   });

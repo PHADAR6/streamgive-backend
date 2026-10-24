@@ -185,7 +185,7 @@ export async function ngoRoutes(app: FastifyInstance): Promise<void> {
       WITH cursor_ngo AS (
         SELECT id, COALESCE(NULLIF(display_name, ''), name) AS public_name, created_at
         FROM ngos
-        WHERE id = ${cursor ?? null}::uuid
+        WHERE id = ${cursor ?? null}::text
       )
       SELECT
         ngo.id,
@@ -202,7 +202,7 @@ export async function ngoRoutes(app: FastifyInstance): Promise<void> {
           OR COALESCE(NULLIF(ngo.display_name, ''), ngo.name) ILIKE '%' || ${q ?? null} || '%'
         )
         AND (
-          ${cursor ?? null}::uuid IS NULL
+          ${cursor ?? null}::text IS NULL
           OR EXISTS (
             SELECT 1
             FROM cursor_ngo AS cursor_row
