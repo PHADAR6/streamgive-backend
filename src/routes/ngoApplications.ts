@@ -83,6 +83,9 @@ export const MAX_APPLICATION_LIST_OFFSET = 10_000;
  */
 const listQuerySchema = z.object({
   status: z.enum(['PENDING', 'APPROVED', 'REJECTED']).optional(),
+  search: z.string().trim().min(1).max(254).optional(),
+  submittedAfter: z.coerce.date().optional(),
+  submittedBefore: z.coerce.date().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(100),
   offset: z.coerce.number().int().min(0).max(MAX_APPLICATION_LIST_OFFSET).default(0),
 });

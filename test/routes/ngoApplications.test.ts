@@ -1,6 +1,7 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
+
 import { sep53Hash } from '../../src/middleware/adminAuth.js';
 
 vi.mock('../../src/notifications/service.js', () => ({ notify: vi.fn() }));
@@ -1100,6 +1101,41 @@ describe('GET /v1/ngo-applications offset bound and stable paging', () => {
       newer.id,
       older.id,
     ]);
+
+    await app.close();
+  });
+});
+
+describe('GET /v1/ngo-applications search and date filters', () => {
+  beforeAll(() => {
+    process.env.ADMIN_ADDRESS = adminKeypair.publicKey();
+  });
+
+  afterEach(async () => {
+    vi.mocked(notify).mockClear();
+    await resetDb();
+  });
+
+  it('filters by search term matching name or contactEmail', async () => {
+    const app = buildServer();
+    const match = await prisma.ngoApplication.create({
+      data: validApplicationPayload({
+        ownerAddress: fakeAddress('S'),
+        name: 'Hope Foundation',
+        contactEmail: 'contact@hope.org',
+      }),
+    });
+    await prisma.ngoApplication.create({
+      data: validApplicationPayload({ ownerAddress: fakeAddress('T'), name: 'Other Org' }),
+    });
+
+    const url = '/v1/ngo-applications?search=hope';
+    const headers = signAdminRequest(adminKeypair, 'GET', url);
+    const response = await app.inject({ method: 'GET', url, headers });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().applications.map((a: { id: string }) => a.id)).toEqual([match.id]);
+    expect(response.json().total).toBe(1);
 
     await app.close();
   });
