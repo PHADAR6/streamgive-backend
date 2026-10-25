@@ -154,6 +154,41 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
   );
 
   /**
+   * Lists distinct token addresses seen across streams, with a stream count for each.
+   * @route GET /v1/tokens
+   * @auth Public
+   * @returns 200 `{ tokens: { tokenAddress: string, streamCount: number }[] }`, sorted by stream count descending then address ascending.
+   */
+  app.get(
+    '/tokens',
+    {
+      schema: {
+        tags: ['Streams'],
+        summary: 'List tokens used by streams',
+        description:
+          'Returns distinct token addresses across all streams with the number of streams per token.',
+        response: {
+          200: { type: 'object', additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      const grouped = await prisma.stream.groupBy({
+        by: ['tokenAddress'],
+        _count: { _all: true },
+        orderBy: [{ _count: { tokenAddress: 'desc' } }, { tokenAddress: 'asc' }],
+      });
+
+      return sendPublicCacheable(request, reply, {
+        tokens: grouped.map((row) => ({
+          tokenAddress: row.tokenAddress,
+          streamCount: row._count._all,
+        })),
+      });
+    },
+  );
+
+  /**
    * Returns a stream by its UUID.
    * @route GET /v1/streams/:id
    * @param id Stream UUID
