@@ -49,6 +49,15 @@ delete querystringDocs.$schema;
 /** Params for stream detail and activity routes; `id` must be a stream UUID. */
 const idParamSchema = z.object({ id: z.string().uuid() });
 
+/** PostgreSQL BigInt is signed 64-bit; on-chain IDs are non-negative integers. */
+const onChainIdParamSchema = z.object({
+  onChainId: z
+    .string()
+    .regex(/^\d+$/)
+    .refine((value) => BigInt(value) <= 9223372036854775807n)
+    .transform((value) => BigInt(value)),
+});
+
 /**
  * Query for GET /v1/streams/:id/activity: `limit` from 1–100 (default 100)
  * and an optional event UUID `cursor`.
@@ -150,6 +159,50 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         hasMore,
         nextCursor: hasMore ? (streams.at(-1)?.id ?? null) : null,
       });
+    },
+  );
+
+  /**
+   * Returns a stream by its on-chain ID.
+   * @route GET /v1/streams/chain/:onChainId
+   * @param onChainId Non-negative decimal on-chain stream ID
+   * @auth Public
+   * @returns 200 serialized stream (including string `onChainId`); 400 invalid ID; 404 `{ error: "not_found" }`.
+   */
+  app.get(
+    '/streams/chain/:onChainId',
+    {
+      schema: {
+        tags: ['Streams'],
+        summary: 'Get a donation stream by on-chain ID',
+        params: {
+          type: 'object',
+          properties: { onChainId: { type: 'string', pattern: '^\\d+$' } },
+          required: ['onChainId'],
+        },
+        response: {
+          200: { type: 'object', additionalProperties: true },
+          400: { type: 'object', additionalProperties: true },
+          404: { type: 'object', additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      const parsedParams = onChainIdParamSchema.safeParse(request.params);
+      if (!parsedParams.success) {
+        return reply.code(400).send({ error: 'invalid_request' });
+      }
+
+      const stream = await prisma.stream.findUnique({
+        where: { onChainId: parsedParams.data.onChainId },
+        include: streamInclude,
+      });
+
+      if (!stream) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      return sendPublicCacheable(request, reply, serializeStream(stream));
     },
   );
 

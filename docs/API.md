@@ -524,6 +524,16 @@ ID and `404 {"error":"not_found"}` if no stream exists. Example response: the
 single stream object shown in the `GET /v1/streams` example (without the
 `streams`, `hasMore`, and `nextCursor` wrapper).
 
+### `GET /v1/streams/chain/{onChainId}`
+
+**Auth:** Public
+
+**Path params:** `onChainId` (required): non-negative decimal on-chain stream ID.
+
+Returns the same stream shape as `GET /v1/streams/{id}`. Returns
+`400 {"error":"invalid_request"}` for an invalid ID and
+`404 {"error":"not_found"}` if no stream exists.
+
 ### `GET /v1/streams/{id}/activity`
 
 **Auth:** Public  

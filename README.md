@@ -172,23 +172,33 @@ shapes, including `ngo_registered`, are documented in
 ```js
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-function isFromStreamGive(rawBody, signatureHeader, secret) {
-  if (!signatureHeader) return false;
+function isFromStreamGive(rawBody, timestamp, deliveryId, signatureHeader, secret) {
+  if (!timestamp || !deliveryId || !signatureHeader) return false;
+  if (!/^\d+$/.test(timestamp)) return false;
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
 
-  const expected = createHmac('sha256', secret).update(rawBody).digest();
-  const received = Buffer.from(signatureHeader, 'hex');
+  const match = /^v1=([0-9a-f]{64})$/.exec(signatureHeader);
+  if (!match) return false;
+
+  const expected = createHmac('sha256', secret)
+    .update(`${timestamp}.${deliveryId}.${rawBody}`)
+    .digest();
+  const received = Buffer.from(match[1], 'hex');
 
   // timingSafeEqual throws on a length mismatch, so check that first.
   return received.length === expected.length && timingSafeEqual(received, expected);
 }
 ```
 
-Reject any request whose signature does not match, and any unsigned request
-once you have configured a secret. When `NOTIFY_WEBHOOK_SECRET` is unset the
-header is omitted entirely, so receivers can be rolled out before the secret
-is configured — but an endpoint that accepts unsigned requests is exactly the
-hole the header exists to close, so treat that as a migration step rather
-than a resting state.
+Call the verifier with the raw body and the three corresponding headers.
+Persist accepted delivery IDs for at least the timestamp acceptance window
+and reject duplicates, along with any request whose signature does not match.
+When `NOTIFY_WEBHOOK_SECRET` is unset the signature header is omitted, so
+configure a secret before requiring signed requests.
+
+Failed webhook deliveries are persisted and retried with exponential backoff
+for up to five attempts. A delivery that exhausts its attempts remains
+recorded as failed for operational inspection.
 
 ### Verifying the signature
 
