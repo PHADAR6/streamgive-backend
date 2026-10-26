@@ -87,9 +87,24 @@ export interface BuildServerOptions {
   trustProxy?: TrustProxySetting;
 }
 
+const DEFAULT_BODY_LIMIT_BYTES = 1_048_576;
+
+function configuredBodyLimit(): number {
+  const value = process.env.BODY_LIMIT_BYTES;
+  if (value === undefined || value.trim() === '') return DEFAULT_BODY_LIMIT_BYTES;
+  if (!/^\d+$/.test(value)) {
+    throw new Error('BODY_LIMIT_BYTES must be a positive integer.');
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error('BODY_LIMIT_BYTES must be a positive integer.');
+  }
+  return parsed;
+}
+
 export function buildServer(options?: BuildServerOptions) {
   const requestStartedAt = new WeakMap<object, bigint>();
-
+  const bodyLimit = configuredBodyLimit();
   const trustProxySetting =
     options?.trustProxy !== undefined
       ? options.trustProxy
@@ -97,6 +112,7 @@ export function buildServer(options?: BuildServerOptions) {
 
   const app = Fastify({
     ...requestIdOptions,
+    bodyLimit,
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
       transport: USE_PRETTY_LOGS
@@ -119,11 +135,16 @@ export function buildServer(options?: BuildServerOptions) {
     }
 
     const chunks: Buffer[] = [];
-
+    let receivedBytes = 0;
     for await (const chunk of payload) {
-      chunks.push(
-        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string),
-      );
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      receivedBytes += bytes.length;
+      if (receivedBytes > bodyLimit) {
+        const error = new Error('Request body is too large.') as FastifyError;
+        error.statusCode = 413;
+        throw error;
+      }
+      chunks.push(bytes);
     }
 
     const raw = Buffer.concat(chunks);

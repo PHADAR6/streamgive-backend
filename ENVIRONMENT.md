@@ -43,6 +43,7 @@ Admin requests are authenticated with a signed timestamp header. The timestamp *
 | `LOG_RETENTION_DAYS` | No | `90` | Age in days before notification logs and resolved indexer dead letters are pruned daily. Unresolved dead letters are retained. |
 | `NODE_ENV` | No | Unset (treated as development) | Set to `production` to switch logging to structured JSON instead of `pino-pretty`. Set automatically inside the Docker image. |
 | `HEALTH_CHECK_TIMEOUT_MS` | No | `3000` | Maximum duration in milliseconds allowed for each health-check dependency call before it is reported as degraded. |
+| `BODY_LIMIT_BYTES` | No | `1048576` | Maximum request body size in bytes (1 MiB). Must be a positive integer. Requests above the limit receive `413 { "error": "payload_too_large" }`. |
 | `RESEND_API_KEY` | No | — | Resend API key used to send NGO contact-email verification messages. Required, together with `NOTIFY_EMAIL_FROM` and `API_PUBLIC_URL`, for verification emails to be sent; other notification events remain in log-only stub mode. |
 | `NOTIFY_EMAIL_FROM` | No | — | Sender address used by Resend for contact-email verification. Required when `RESEND_API_KEY` is configured. |
 | `NOTIFY_EMAIL_TO` | No (planned) | — | Planned recipient address for notification emails. Not yet read by runtime code. |
