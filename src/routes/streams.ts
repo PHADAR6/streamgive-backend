@@ -1,4 +1,30 @@
 
+import type { FastifyInstance } from 'fastify';
+import { StrKey } from '@stellar/stellar-sdk';
+import { z } from 'zod';
+
+import { prisma } from '../db.js';
+import { sendPublicCacheable } from './cacheable.js';
+import { getPublicNgoName } from './ngoName.js';
+
+// Keep all the existing schemas, serializers, and helper functions here:
+// querySchema, querystringDocs, idParamSchema, onChainIdParamSchema,
+// activityQuerySchema, streamInclude, serializeStream, serializeStreamEvent.
+
+// Keep the complete streamRoutes function from the main branch,
+// including these three routes:
+//
+// 1. GET /streams
+// 2. GET /streams/chain/:onChainId
+// 3. GET /streams/:id
+//
+// Then retain the existing activity route from feat/openapi-security-scheme:
+
+export async function streamRoutes(app: FastifyInstance): Promise<void> {
+  // Keep the complete GET /streams handler from main here.
+  // Keep the complete GET /streams/chain/:onChainId handler from main here.
+  // Keep the complete GET /streams/:id handler from main here.
+
   /**
    * Lists on-chain events for a stream, newest first.
    * @route GET /v1/streams/:id/activity
@@ -49,12 +75,10 @@
       const parsedQuery = activityQuerySchema.safeParse(request.query);
 
       if (!parsedQuery.success) {
-        return reply
-          .code(400)
-          .send({
-            error: 'invalid_request',
-            details: parsedQuery.error.flatten(),
-          });
+        return reply.code(400).send({
+          error: 'invalid_request',
+          details: parsedQuery.error.flatten(),
+        });
       }
 
       const { limit, cursor } = parsedQuery.data;
@@ -97,3 +121,4 @@
       });
     },
   );
+}

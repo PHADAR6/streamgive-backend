@@ -8,6 +8,7 @@ import { getLatestLedgerSequence, rpcServer } from '../stellar/rpc.js';
 import { getCheckpointState, saveCheckpoint } from './checkpoint.js';
 import { WATCHED_CONTRACT_IDS } from './contracts.js';
 import { recordDeadLetter } from './deadLetter.js';
+import { tryAcquireIndexerLock, type IndexerLock } from './lock.js';
 
 const POLL_INTERVAL_MS = Number(process.env.INDEXER_POLL_INTERVAL_MS ?? 5000);
 const START_LEDGER = process.env.INDEXER_START_LEDGER
@@ -267,6 +268,8 @@ export function startIndexer(handleEvent: EventHandler): () => Promise<void> {
   // long until the next attempt instead of the interval timer overriding it.
   let timer: NodeJS.Timeout | undefined;
   let inFlight: Promise<void> | undefined;
+  let indexerLock: IndexerLock | undefined;
+  let lockWaitLogged = false;
   let consecutiveFailures = 0;
   let stopped = false;
 
@@ -287,6 +290,24 @@ export function startIndexer(handleEvent: EventHandler): () => Promise<void> {
 
     inFlight = (async () => {
       try {
+        if (indexerLock && !indexerLock.isHeld()) {
+          await indexerLock.release();
+          indexerLock = undefined;
+        }
+        if (!indexerLock) {
+          indexerLock = await tryAcquireIndexerLock();
+          if (!indexerLock) {
+            if (!lockWaitLogged) {
+              console.info('indexer: another worker holds the advisory lock; waiting');
+              lockWaitLogged = true;
+            }
+            return;
+          }
+          lockWaitLogged = false;
+          console.info('indexer: acquired advisory lock');
+        }
+        if (stopped || !indexerLock.isHeld()) return;
+
         await pollOnce(handleEvent);
         consecutiveFailures = 0;
         consecutivePollFailures = 0;
@@ -319,5 +340,7 @@ export function startIndexer(handleEvent: EventHandler): () => Promise<void> {
     stopped = true;
     clearTimeout(timer);
     await inFlight;
+    await indexerLock?.release();
+    indexerLock = undefined;
   };
 }

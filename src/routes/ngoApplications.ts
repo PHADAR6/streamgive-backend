@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { prisma } from '../db.js';
 import { requireAdminSignature, sep53Hash } from '../middleware/adminAuth.js';
 import { notify } from '../notifications/service.js';
+import { sendContactVerification, verifyContactToken } from '../notifications/contactVerification.js';
 
 const APPLICATION_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
@@ -96,6 +97,8 @@ const statusQuerySchema = z.object({
   // Same regex as GET /ngos/lookup.
   ownerAddress: z.string().regex(/^G[A-Z2-7]{55}$/),
 });
+
+const contactVerificationTokenSchema = z.object({ token: z.string().length(43) });
 
 /** Review body for approve/reject; optional `reviewNote` is at most 2000 characters. */
 const reviewBodySchema = z.object({
@@ -259,7 +262,52 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
         ownerAddress: result.application.ownerAddress,
         name: result.application.name,
       });
+      await sendContactVerification(result.application);
       return reply.code(201).send(result.application);
+    },
+  );
+
+  /**
+   * Redeems the one-time link sent to an NGO application's contact email.
+   * @route GET /v1/ngo-applications/verify-contact-email
+   * @query token opaque, single-use token sent by email
+   * @returns 200 `{ verified: true }`; 400 invalid or expired token.
+   */
+  app.get('/ngo-applications/verify-contact-email', async (request, reply) => {
+    const parsed = contactVerificationTokenSchema.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_or_expired_token' });
+    const verified = await verifyContactToken(parsed.data.token);
+    if (!verified) return reply.code(400).send({ error: 'invalid_or_expired_token' });
+    return { verified: true };
+  });
+
+  /**
+   * Sends another verification link without revealing whether the application exists.
+   * @route POST /v1/ngo-applications/:id/contact-email-verification
+   * @returns 202 `{ message }` for missing, verified, or resent applications.
+   */
+  app.post(
+    '/ngo-applications/:id/contact-email-verification',
+    {
+      config: {
+        rateLimit: {
+          max: Number(process.env.RATE_LIMIT_APPLICATION_MAX ?? 5),
+          timeWindow: process.env.RATE_LIMIT_APPLICATION_WINDOW ?? '1 minute',
+        },
+      },
+    },
+    async (request, reply) => {
+      const parsedParams = idParamSchema.safeParse(request.params);
+      if (parsedParams.success) {
+        const application = await prisma.ngoApplication.findUnique({
+          where: { id: parsedParams.data.id },
+          select: { id: true, name: true, contactEmail: true, emailVerifiedAt: true },
+        });
+        if (application && !application.emailVerifiedAt) {
+          await sendContactVerification(application);
+        }
+      }
+      return reply.code(202).send({ message: 'If eligible, a verification email has been sent.' });
     },
   );
 
@@ -479,6 +527,9 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
       if (application.status !== 'PENDING') {
         return reply.code(409).send({ error: 'already_reviewed' });
       }
+      if (!application.emailVerifiedAt) {
+        return reply.code(409).send({ error: 'contact_email_unverified' });
+      }
 
       try {
         const reviewed = await prisma.ngoApplication.update({
@@ -552,6 +603,9 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
       }
       if (application.status !== 'PENDING') {
         return reply.code(409).send({ error: 'already_reviewed' });
+      }
+      if (!application.emailVerifiedAt) {
+        return reply.code(409).send({ error: 'contact_email_unverified' });
       }
 
       try {

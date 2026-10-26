@@ -100,13 +100,26 @@ model NgoApplication {
   reviewNote   String?              @map("review_note")
   reviewedBy   String?              @map("reviewed_by")
   reviewedAt   DateTime?            @map("reviewed_at")
+  emailVerifiedAt DateTime?         @map("email_verified_at")
   createdAt    DateTime             @default(now()) @map("created_at")
   updatedAt    DateTime             @updatedAt @map("updated_at")
+  contactEmailChallenge NgoApplicationContactChallenge?
 
   @@index([ownerAddress])
   @@index([status])
   @@index([createdAt])
   @@map("ngo_applications")
+}
+
+model NgoApplicationContactChallenge {
+  tokenHash     String         @id @map("token_hash")
+  applicationId String         @unique @map("application_id")
+  expiresAt     DateTime       @map("expires_at")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  application   NgoApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("ngo_application_contact_challenges")
 }
 
 model NgoApplicationChallenge {
@@ -129,6 +142,21 @@ model NotificationLog {
 
   @@unique([eventId, channel])
   @@map("notification_logs")
+}
+
+/// Configured webhook destinations. Event names are stored as strings so a
+/// deployment can add event types without a database enum migration.
+model NotificationEndpoint {
+  id         String   @id @default(uuid())
+  url        String
+  secret     String
+  eventTypes String[] @default([]) @map("event_types")
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@index([enabled])
+  @@map("notification_endpoints")
 }
 
 /// Single-row-per-id table tracking how far the event indexer has gotten,
