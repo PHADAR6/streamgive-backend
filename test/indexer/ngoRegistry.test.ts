@@ -100,4 +100,40 @@ describe('handleNgoRegistryEvent', () => {
     ngo = await prisma.ngo.findUnique({ where: { ownerAddress: owner } });
     expect(ngo?.verified).toBe(false);
   });
+
+  it('dispatches ngo_approved notification for approved event', async () => {
+    const owner = fakeAddress('F');
+    await prisma.ngo.create({ data: { ownerAddress: owner, name: 'Save the Whales' } });
+
+    const event = makeEvent([symbolScVal('approved'), addressScVal(owner)], stringScVal(''));
+    await handleNgoRegistryEvent(event);
+
+    const ngo = await prisma.ngo.findUnique({ where: { ownerAddress: owner } });
+    expect(ngo?.verified).toBe(true);
+
+    expect(dispatchNotification).toHaveBeenCalledWith({
+      type: 'ngo_approved',
+      ownerAddress: owner,
+      ngoId: ngo!.id,
+      eventId: event.id,
+    });
+  });
+
+  it('dispatches ngo_revoked notification for revoked event', async () => {
+    const owner = fakeAddress('G');
+    await prisma.ngo.create({ data: { ownerAddress: owner, name: 'Green Earth', verified: true } });
+
+    const event = makeEvent([symbolScVal('revoked'), addressScVal(owner)], stringScVal(''));
+    await handleNgoRegistryEvent(event);
+
+    const ngo = await prisma.ngo.findUnique({ where: { ownerAddress: owner } });
+    expect(ngo?.verified).toBe(false);
+
+    expect(dispatchNotification).toHaveBeenCalledWith({
+      type: 'ngo_revoked',
+      ownerAddress: owner,
+      ngoId: ngo!.id,
+      eventId: event.id,
+    });
+  });
 });
