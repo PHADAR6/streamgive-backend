@@ -96,9 +96,19 @@ describe('handleNgoRegistryEvent', () => {
     let ngo = await prisma.ngo.findUnique({ where: { ownerAddress: owner } });
     expect(ngo?.verified).toBe(true);
 
-    await handleNgoRegistryEvent(makeEvent([symbolScVal('revoked'), addressScVal(owner)], stringScVal('')));
+    const txHash = '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
+    const event = makeEvent([symbolScVal('revoked'), addressScVal(owner)], stringScVal(''), { txHash });
+    await handleNgoRegistryEvent(event);
     ngo = await prisma.ngo.findUnique({ where: { ownerAddress: owner } });
     expect(ngo?.verified).toBe(false);
+
+    // A StreamEvent row must be written atomically with the ngo update.
+    const streamEvent = await prisma.streamEvent.findFirst({ where: { type: 'revoked' } });
+    expect(streamEvent).not.toBeNull();
+    expect(streamEvent?.streamId).toBeNull();
+    expect(streamEvent?.ledger).toBe(100);
+    expect(streamEvent?.txHash).toBe(txHash);
+    expect(streamEvent?.payload).toMatchObject({ ownerAddress: owner });
   });
 
   it('dispatches ngo_approved notification for approved event', async () => {
