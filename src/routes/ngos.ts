@@ -255,7 +255,17 @@ export async function ngoRoutes(app: FastifyInstance): Promise<void> {
    * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
    * @returns 200 `{ ngos: Ngo[], nextCursor: string | null }`; 400 `{ error: "invalid_request", details }`.
    */
-  app.get('/ngos/all', { preHandler: requireAdminSignature }, async (request, reply) => {
+  app.get(
+    '/ngos/all',
+    {
+      preHandler: requireAdminSignature,
+      schema: {
+        tags: ['NGOs'],
+        summary: 'Lists all NGOs, including unverified entries, for admin review',
+        security: [{ adminAddress: [], adminSignature: [], adminTimestamp: [] }],
+      },
+    },
+    async (request, reply) => {
     const parsedQuery = adminListQuerySchema.safeParse(request.query);
     if (!parsedQuery.success) {
       return reply
@@ -398,7 +408,17 @@ export async function ngoRoutes(app: FastifyInstance): Promise<void> {
    * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
    * @returns 200 updated NGO with its effective public `name`; 400 invalid params/body; 404 `{ error: "not_found" }`.
    */
-  app.patch('/admin/ngos/:id', { preHandler: requireAdminSignature }, async (request, reply) => {
+  app.patch(
+    '/admin/ngos/:id',
+    {
+      preHandler: requireAdminSignature,
+      schema: {
+        tags: ['NGOs'],
+        summary: "Updates or clears the NGO's public display name",
+        security: [{ adminAddress: [], adminSignature: [], adminTimestamp: [] }],
+      },
+    },
+    async (request, reply) => {
     const parsedParams = idParamSchema.safeParse(request.params);
     if (!parsedParams.success) {
       return reply.code(400).send({ error: 'invalid_request' });
