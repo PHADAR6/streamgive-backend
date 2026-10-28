@@ -1,21 +1,27 @@
 import type { Keypair } from '@stellar/stellar-sdk';
 
-import { sep53Hash } from '../../src/middleware/adminAuth.js';
+import { bodyHash, sep53Hash } from '../../src/middleware/adminAuth.js';
 
 /** Builds the three headers requireAdminSignature expects, signed for one
- * specific method+url pair — mirrors exactly what the middleware verifies,
- * including the SEP-53 message-signing prefix/hash a real wallet applies.
+ * specific method+url+body combination — mirrors exactly what the middleware
+ * verifies, including the SEP-53 message-signing prefix/hash a real wallet
+ * applies.
  *
  * The timestamp must be a Unix epoch timestamp in **milliseconds** (e.g.
  * `Date.now().toString()`), not seconds. Pass the default to avoid unit
- * ambiguity. */
+ * ambiguity.
+ *
+ * The body parameter must be the raw request body (string or Buffer). Omit
+ * or pass an empty string/Buffer for bodyless requests (GET, DELETE, etc.).
+ */
 export function signAdminRequest(
   keypair: Keypair,
   method: string,
   url: string,
   timestamp: string = Date.now().toString(),
+  body: Buffer | string = '',
 ): Record<string, string> {
-  const payload = `${method}:${url}:${timestamp}`;
+  const payload = `${method}:${url}:${timestamp}:${bodyHash(body)}`;
   // `sign()` returns a Uint8Array, not a Buffer — calling `.toString('base64')`
   // on it straight would hit Array.prototype.toString, which ignores the
   // encoding argument and yields "166,129,8,..." (decimal bytes). That decodes

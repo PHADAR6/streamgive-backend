@@ -13,18 +13,24 @@ Routes marked **Admin signature** require all three headers:
 - `x-admin-address`: an allowed Stellar public key configured by
   `ADMIN_ADDRESS` or `ADMIN_ADDRESSES`.
 - `x-admin-timestamp`: the current Unix timestamp in milliseconds.
-- `x-admin-signature`: the SEP-53 Stellar message signature for
-  `METHOD:PATH_AND_QUERY:TIMESTAMP`, where the timestamp is the exact header
-  value. For example, sign `GET:/v1/ngo-applications?limit=20:1760000000000`
-  for that request.
+- `x-admin-signature`: a base64 or hexadecimal Ed25519 signature over the
+  SEP-53 hash of `METHOD:URL:TIMESTAMP:BODY_HASH`, where the timestamp is the
+  exact header value. `URL` includes the `/v1` prefix and query string; for
+  example, `/v1/ngo-applications?limit=20`. `BODY_HASH` is the lowercase hex
+  SHA-256 of the raw request body, or the SHA-256 of the empty body for
+  bodyless requests. SEP-53 hashes the UTF-8 bytes of
+  `Stellar Signed Message:\n` followed by the complete payload before the
+  wallet signs it with its generic message-signing operation.
 
 The signed message must use the generic Stellar message-signing operation.
 Signatures expire when the timestamp is more than five minutes from the
 server's clock, and a signature cannot be replayed. Admin routes return
-`401` for missing or invalid authentication, `503` with
-`{"error":"admin_auth_not_configured"}` if no admin address is configured,
-and `401` with `{"error":"timestamp_unit_mismatch"}` for a timestamp in
-seconds.
+`401 unauthorized` for missing headers, an unlisted address, or an invalid
+signature; `401 stale_signature` for a malformed or out-of-window timestamp;
+`401 timestamp_unit_mismatch` for a seconds-based timestamp; and
+`401 replayed_signature` when the same address, method, URL, and timestamp
+are reused. They return `503 admin_auth_not_configured` when both admin
+address settings are empty. See the HTTP error contract below for examples.
 
 Routes marked **Public** do not require authentication. Public directory,
 stream, and impact endpoints may return `304 Not Modified` when the
@@ -32,6 +38,29 @@ stream, and impact endpoints may return `304 Not Modified` when the
 
 Unknown routes return `404` with the same body used by every other missing
 resource: `{"error":"not_found"}`.
+
+## HTTP error contract
+
+Error responses are JSON objects with a stable `error` code. Validation
+responses may also include a `details` object; clients should branch on the
+`error` value rather than parse human-readable messages. The table lists the
+codes returned by the API and an example response body for each.
+
+| HTTP status | Error code | Meaning | Example response body |
+| --- | --- | --- | --- |
+| 400 | `invalid_request` | A route parameter, query, or request body failed validation. Some validation errors include `details`. | `{"error":"invalid_request"}` |
+| 400 | `invalid_or_expired_challenge` | An NGO application challenge is missing, expired, or already consumed. | `{"error":"invalid_or_expired_challenge"}` |
+| 401 | `unauthorized` | Admin signature or configured metrics authentication is missing or invalid. | `{"error":"unauthorized"}` |
+| 401 | `invalid_signature` | The signature for an NGO application challenge did not verify. | `{"error":"invalid_signature"}` |
+| 401 | `stale_signature` | The admin timestamp is malformed or outside the permitted clock-skew window. | `{"error":"stale_signature"}` |
+| 401 | `timestamp_unit_mismatch` | The admin timestamp appears to be in seconds; send Unix milliseconds. | `{"error":"timestamp_unit_mismatch"}` |
+| 401 | `replayed_signature` | The same admin address and timestamp have already been used. | `{"error":"replayed_signature"}` |
+| 404 | `not_found` | The requested route or resource does not exist. | `{"error":"not_found"}` |
+| 409 | `already_reviewed` | The NGO application is no longer pending review. | `{"error":"already_reviewed"}` |
+| 409 | `application_already_pending` | An application for this owner is already pending. | `{"error":"application_already_pending"}` |
+| 409 | `already_approved` | This owner already has an approved application. | `{"error":"already_approved"}` |
+| 503 | `admin_auth_not_configured` | Admin-protected routes are unavailable until an admin address is configured. | `{"error":"admin_auth_not_configured"}` |
+| 500 | `internal_server_error` | An unexpected server error occurred; internal details are not returned. | `{"error":"internal_server_error"}` |
 
 ## Caching and conditional requests
 
@@ -495,6 +524,16 @@ ID and `404 {"error":"not_found"}` if no stream exists. Example response: the
 single stream object shown in the `GET /v1/streams` example (without the
 `streams`, `hasMore`, and `nextCursor` wrapper).
 
+### `GET /v1/streams/chain/{onChainId}`
+
+**Auth:** Public
+
+**Path params:** `onChainId` (required): non-negative decimal on-chain stream ID.
+
+Returns the same stream shape as `GET /v1/streams/{id}`. Returns
+`400 {"error":"invalid_request"}` for an invalid ID and
+`404 {"error":"not_found"}` if no stream exists.
+
 ### `GET /v1/streams/{id}/activity`
 
 **Auth:** Public  
@@ -707,7 +746,21 @@ pages are stable when several applications share a creation time.
 Returns one application record. Returns `400 {"error":"invalid_request"}`
 for an invalid ID and `404 {"error":"not_found"}` if none exists. Example
 response: the application object shown in the `POST /v1/ngo-applications`
-example, with its current status and review note.
+example, with its current status, review note, and `emailVerifiedAt` (`null`
+until the submitted contact address is verified).
+
+### `GET /v1/ngo-applications/verify-contact-email?token={token}`
+
+**Auth:** Public; requires the single-use token sent to the application contact
+email. Tokens expire after 24 hours. Returns `200` when verified or
+`400 {"error":"invalid_or_expired_token"}` when invalid, expired, or already
+used.
+
+### `POST /v1/ngo-applications/{id}/contact-email-verification`
+
+**Auth:** Admin signature. Sends a fresh verification link for an application
+that has not been verified. Returns `202` with a generic response whether the
+application is eligible or not, to avoid disclosing application status.
 
 ### `POST /v1/ngo-applications/{id}/approve`
 
@@ -722,6 +775,8 @@ Returns `400 {"error":"invalid_request"}` for invalid input,
 `409 {"error":"already_reviewed"}` if it is no longer pending. Example
 response: the application object shown in the `POST /v1/ngo-applications`
 example, with `status` set to `APPROVED` and `reviewNote` set if supplied.
+Approval is available only after the contact email is verified; otherwise the
+endpoint returns `409 {"error":"contact_email_unverified"}`.
 
 ### `POST /v1/ngo-applications/{id}/reject`
 
@@ -736,6 +791,8 @@ Returns `400 {"error":"invalid_request"}` for invalid input,
 `409 {"error":"already_reviewed"}` if it is no longer pending. Example
 response: the application object shown in the `POST /v1/ngo-applications`
 example, with `status` set to `REJECTED` and `reviewNote` set if supplied.
+Review is available only after the contact email is verified; otherwise the
+endpoint returns `409 {"error":"contact_email_unverified"}`.
 
 ## Indexer
 
