@@ -1,7 +1,7 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { sep53Hash } from '../../src/middleware/adminAuth.js';
+import { bodyHash, sep53Hash } from '../../src/middleware/adminAuth.js';
 import { buildServer } from '../../src/server.js';
 import { signAdminRequest } from '../helpers/adminAuth.js';
 
@@ -88,10 +88,10 @@ describe('requireAdminSignature', () => {
   it('rejects a self-signed request from an address that is not an admin', async () => {
     configureAdmins(legacyAdmin.publicKey(), listedAdmin.publicKey());
 
-    const response = await listApplicationsAs(unlistedAdmin);
-
     // The signature is valid for unlistedAdmin's own key -- it still isn't
     // an admin, so the allow-list check has to be what rejects it.
+    const response = await listApplicationsAs(unlistedAdmin);
+
     expect(response.statusCode).toBe(401);
     expect(response.body.error).toBe('unauthorized');
   });
@@ -143,26 +143,110 @@ describe('requireAdminSignature', () => {
     await app.close();
   });
 
-  it('accepts hex-encoded signatures', async () => {
+  it('rejects a stale signature (timestamp outside the ±5-min window)', async () => {
     configureAdmins(legacyAdmin.publicKey());
 
     const app = buildServer();
-    const timestamp = Date.now().toString();
-    const payload = `GET:/v1/ngo-applications:${timestamp}`;
-    const signatureHex = Buffer.from(legacyAdmin.sign(sep53Hash(payload))).toString('hex');
+    const staleTs = (Date.now() - 6 * 60 * 1000).toString(); // 6 minutes ago
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/ngo-applications',
+      headers: signAdminRequest(legacyAdmin, 'GET', '/v1/ngo-applications', staleTs),
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json<{ error: string }>().error).toBe('stale_signature');
+  });
+
+  it('rejects a seconds-precision timestamp with timestamp_unit_mismatch', async () => {
+    configureAdmins(legacyAdmin.publicKey());
+
+    const app = buildServer();
+    const secondsTs = Math.floor(Date.now() / 1000).toString(); // 10-digit seconds value
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/ngo-applications',
+      headers: signAdminRequest(legacyAdmin, 'GET', '/v1/ngo-applications', secondsTs),
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json<{ error: string }>().error).toBe('timestamp_unit_mismatch');
+  });
+
+  it('rejects a request when the body has been tampered with', async () => {
+    configureAdmins(legacyAdmin.publicKey());
+
+    const app = buildServer();
+    const ts = Date.now().toString();
+    const originalBody = JSON.stringify({ reviewNote: 'approved' });
+    const tamperedBody = JSON.stringify({ reviewNote: 'rejected' });
+
+    // Sign over the original body, but send a different body
+    const headers = signAdminRequest(legacyAdmin, 'POST', '/v1/ngo-applications/00000000-0000-0000-0000-000000000000/approve', ts, originalBody);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ngo-applications/00000000-0000-0000-0000-000000000000/approve',
+      headers: { ...headers, 'content-type': 'application/json' },
+      payload: tamperedBody,
+    });
+    await app.close();
+
+    // The body hash in the signed payload won't match the tampered body,
+    // so the signature verification fails.
+    expect(response.statusCode).toBe(401);
+    expect(response.json<{ error: string }>().error).toBe('unauthorized');
+  });
+
+  it('accepts a valid hex-encoded signature (not base64)', async () => {
+    configureAdmins(legacyAdmin.publicKey());
+
+    const app = buildServer();
+    const ts = Date.now().toString();
+    const hash = sep53Hash(`GET:/v1/ngo-applications:${ts}:${bodyHash('')}`);
+    const hexSig = Buffer.from(legacyAdmin.sign(hash)).toString('hex');
 
     const response = await app.inject({
       method: 'GET',
       url: '/v1/ngo-applications',
       headers: {
         'x-admin-address': legacyAdmin.publicKey(),
-        'x-admin-signature': signatureHex,
-        'x-admin-timestamp': timestamp,
+        'x-admin-signature': hexSig,
+        'x-admin-timestamp': ts,
       },
     });
+    await app.close();
 
     expect(response.statusCode).toBe(200);
+  });
 
-    await app.close();
+  it('rejects a replayed signature', async () => {
+    configureAdmins(legacyAdmin.publicKey());
+
+    const ts = Date.now().toString();
+    const headers = signAdminRequest(legacyAdmin, 'GET', '/v1/ngo-applications', ts);
+
+    // First request succeeds
+    const app1 = buildServer();
+    const first = await app1.inject({
+      method: 'GET',
+      url: '/v1/ngo-applications',
+      headers,
+    });
+    await app1.close();
+    expect(first.statusCode).toBe(200);
+
+    // Second request with the same timestamp is a replay
+    const app2 = buildServer();
+    const second = await app2.inject({
+      method: 'GET',
+      url: '/v1/ngo-applications',
+      headers,
+    });
+    await app2.close();
+    expect(second.statusCode).toBe(401);
+    expect(second.json<{ error: string }>().error).toBe('replayed_signature');
   });
 });

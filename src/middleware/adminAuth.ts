@@ -27,6 +27,17 @@ const SEP53_PREFIX = 'Stellar Signed Message:\n';
 
 const usedSignatures = new Map<string, number>();
 
+function pruneUsedSignatures(now = Date.now()): void {
+  for (const [key, seenAt] of usedSignatures) {
+    if (now - seenAt > MAX_CLOCK_SKEW_MS) usedSignatures.delete(key);
+  }
+}
+
+// Keep request handling independent of cache size. The timer is unreferenced
+// so it does not keep a short-lived process (or a test runner) alive.
+const replayCachePruner = setInterval(pruneUsedSignatures, 60_000);
+replayCachePruner.unref();
+
 /** Exported so tests can sign fixtures the same way a real wallet would,
  * rather than re-deriving (and risking drift from) this exact construction. */
 export function sep53Hash(message: string): Buffer {
@@ -62,13 +73,33 @@ function configuredAdminAddresses(): string[] {
 }
 
 /**
+ * Returns the lower-case hex SHA-256 digest of `body`.  The empty string
+ * is the canonical "no body" sentinel — callers that have no body must pass
+ * an empty Buffer (or omit the argument), which produces the well-known
+ * SHA-256 of zero bytes:
+ *   e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+ *
+ * Exported so the test helper and any future client SDK can hash bodies the
+ * same way the middleware does.
+ */
+export function bodyHash(body: Buffer | string = ''): string {
+  return createHash('sha256').update(body).digest('hex');
+}
+
+/**
  * Verifies the caller controls one of the configured admin keypairs,
  * without a private key ever crossing the wire: the client signs
- * `${method}:${url}:${timestamp}` with their Stellar wallet (via its
- * generic message-signing call, not transaction-signing) and sends the
- * pieces as headers. The timestamp both binds the signature to this one
+ * `${method}:${url}:${timestamp}:${bodyHash}` with their Stellar wallet
+ * (via its generic message-signing call, not transaction-signing) and sends
+ * the pieces as headers. The timestamp both binds the signature to this one
  * request and bounds replay — a captured header set is only useful for a
- * few minutes.
+ * few minutes. The body hash prevents an attacker who intercepts a valid
+ * signed request from replaying it with a different request body.
+ *
+ * `bodyHash` is the lower-case hex SHA-256 of the raw request body, or the
+ * SHA-256 of an empty buffer for requests that carry no body (GET, DELETE,
+ * etc.).  The value is always included so there is no ambiguity about the
+ * payload format.
  *
  * The `X-Admin-Timestamp` value must be a Unix epoch timestamp in
  * *milliseconds* (`Date.now()`), not seconds. Seconds-based values are
@@ -126,7 +157,14 @@ export async function requireAdminSignature(
     return;
   }
 
-  const payload = `${request.method}:${request.url}:${timestampHeader}`;
+  // Include the body hash in the signed payload so the body cannot be
+  // swapped out on a replayed/intercepted request. Fastify exposes the raw
+  // body as `request.rawBody` when the `rawBody` plugin/option is active;
+  // fall back to an empty Buffer (= hash of zero bytes) for bodyless
+  // requests and for frameworks where rawBody is not populated.
+  const rawBody: Buffer | string =
+    (request as FastifyRequest & { rawBody?: Buffer | string }).rawBody ?? '';
+  const payload = `${request.method}:${request.url}:${timestampHeader}:${bodyHash(rawBody)}`;
 
   try {
     const keypair = Keypair.fromPublicKey(address);
@@ -142,11 +180,8 @@ export async function requireAdminSignature(
       ['hex', Buffer.from(signatureB64, 'hex')],
     ];
 
-    const replayKey = `${address}:${timestampHeader}`;
+    const replayKey = `${address}:${request.method}:${request.url}:${timestampHeader}`;
     const now = Date.now();
-    for (const [key, seenAt] of usedSignatures) {
-      if (now - seenAt > MAX_CLOCK_SKEW_MS) usedSignatures.delete(key);
-    }
     if (usedSignatures.has(replayKey)) {
       reply.code(401).send({ error: 'replayed_signature' });
       return;
