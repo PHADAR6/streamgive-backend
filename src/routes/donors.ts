@@ -31,7 +31,15 @@ export async function donorRoutes(app: FastifyInstance): Promise<void> {
    * @auth Public
    * @returns 200 `{ donors: DonorWithTotals[], nextCursor: string | null }`; 400 `{ error: "invalid_request" }` for invalid query or cursor.
    */
-  app.get('/donors', async (request, reply) => {
+  app.get(
+    '/donors',
+    {
+      schema: {
+        tags: ['Donors'],
+        summary: 'Lists donors ranked by committed or withdrawn amount',
+      },
+    },
+    async (request, reply) => {
     const parsedQuery = querySchema.safeParse(request.query);
     if (!parsedQuery.success) {
       return reply
@@ -99,7 +107,15 @@ export async function donorRoutes(app: FastifyInstance): Promise<void> {
    * @auth Public
    * @returns 200 donor with decimal-string `totalCommitted` and `totalWithdrawn`, plus `activeStreamCount` and `distinctNgoCount`; 400 invalid address; 404 `{ error: "not_found" }`.
    */
-  app.get('/donors/:address', async (request, reply) => {
+  app.get(
+    '/donors/:address',
+    {
+      schema: {
+        tags: ['Donors'],
+        summary: "Returns one donor's aggregate giving statistics",
+      },
+    },
+    async (request, reply) => {
     const parsedParams = addressParamSchema.safeParse(request.params);
     if (!parsedParams.success) {
       return reply.code(400).send({ error: 'invalid_request' });

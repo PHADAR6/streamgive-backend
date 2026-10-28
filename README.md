@@ -78,16 +78,38 @@ Keeping off-chain application review separate from on-chain contract approval en
 
 Admin routes are protected by a signed request scheme (`requireAdminSignature`). Each request must include:
 
-- `x-admin-address` — the admin's Stellar public key (`G...`), which must match `ADMIN_ADDRESS`.
+- `x-admin-address` — the admin's Stellar public key (`G...`), which must appear in `ADMIN_ADDRESS` or `ADMIN_ADDRESSES`.
 - `x-admin-timestamp` — the current time as a Unix timestamp in **milliseconds** (e.g. `Date.now()` in JavaScript).
-- `x-admin-signature` — a signature over the request payload including the timestamp.
+- `x-admin-signature` — a base64 or hex Ed25519 signature over the signed payload (see below).
 
-The timestamp must be within a±5-minute skew of the server's clock. The unit is
-**milliseconds**, not seconds. A client that sends a Unix timestamp
-in seconds (typically 10 digits) will be rejected with a `stale_signature`
-error. To avoid ambiguity, the server explicitly rejects timestamps that
-look like seconds with a clear `admin_timestamp_unit` error instead of a
-generic stale-signature failure.
+### Signed payload
+
+The signature is produced by signing the following string with the admin's Stellar keypair via the SEP-53 generic message-signing scheme (`SHA-256(prefix + message)`, where `prefix = "Stellar Signed Message:\n"`):
+
+```
+METHOD:url:timestamp:bodyHash
+```
+
+- **METHOD** — HTTP method in upper-case, e.g. `GET`, `POST`, `PATCH`.
+- **url** — the full request URL including path and query string, e.g. `/v1/ngo-applications?status=PENDING`.
+- **timestamp** — the `x-admin-timestamp` value (milliseconds).
+- **bodyHash** — lower-case hex SHA-256 of the raw request body, or the SHA-256 of an empty buffer (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`) for bodyless requests (GET, DELETE, etc.).
+
+Including the body hash in the signed payload prevents an attacker who intercepts a valid request from replaying it with a different body (e.g. a different `reviewNote`) inside the replay window.
+
+### Timestamp rules
+
+The timestamp must be within ±5 minutes of the server's clock. The unit is **milliseconds**, not seconds. Sending a 10-digit seconds-precision timestamp is rejected with `timestamp_unit_mismatch` (not `stale_signature`) so clients get a clear signal.
+
+### Error codes
+
+| Error | Status | Meaning |
+|---|---|---|
+| `unauthorized` | 401 | Missing or invalid headers, address not on allow-list, or signature did not verify |
+| `stale_signature` | 401 | Timestamp is malformed or outside the ±5-minute replay window |
+| `timestamp_unit_mismatch` | 401 | Timestamp looks like seconds (< 10^11); send milliseconds |
+| `replayed_signature` | 401 | The same address+timestamp+method+url has already been used in this window |
+| `admin_auth_not_configured` | 503 | Neither `ADMIN_ADDRESS` nor `ADMIN_ADDRESSES` is set |
 
 ## Local development
 
@@ -150,23 +172,33 @@ shapes, including `ngo_registered`, are documented in
 ```js
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-function isFromStreamGive(rawBody, signatureHeader, secret) {
-  if (!signatureHeader) return false;
+function isFromStreamGive(rawBody, timestamp, deliveryId, signatureHeader, secret) {
+  if (!timestamp || !deliveryId || !signatureHeader) return false;
+  if (!/^\d+$/.test(timestamp)) return false;
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
 
-  const expected = createHmac('sha256', secret).update(rawBody).digest();
-  const received = Buffer.from(signatureHeader, 'hex');
+  const match = /^v1=([0-9a-f]{64})$/.exec(signatureHeader);
+  if (!match) return false;
+
+  const expected = createHmac('sha256', secret)
+    .update(`${timestamp}.${deliveryId}.${rawBody}`)
+    .digest();
+  const received = Buffer.from(match[1], 'hex');
 
   // timingSafeEqual throws on a length mismatch, so check that first.
   return received.length === expected.length && timingSafeEqual(received, expected);
 }
 ```
 
-Reject any request whose signature does not match, and any unsigned request
-once you have configured a secret. When `NOTIFY_WEBHOOK_SECRET` is unset the
-header is omitted entirely, so receivers can be rolled out before the secret
-is configured — but an endpoint that accepts unsigned requests is exactly the
-hole the header exists to close, so treat that as a migration step rather
-than a resting state.
+Call the verifier with the raw body and the three corresponding headers.
+Persist accepted delivery IDs for at least the timestamp acceptance window
+and reject duplicates, along with any request whose signature does not match.
+When `NOTIFY_WEBHOOK_SECRET` is unset the signature header is omitted, so
+configure a secret before requiring signed requests.
+
+Failed webhook deliveries are persisted and retried with exponential backoff
+for up to five attempts. A delivery that exhausts its attempts remains
+recorded as failed for operational inspection.
 
 ### Verifying the signature
 

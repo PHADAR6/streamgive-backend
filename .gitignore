@@ -2,11 +2,10 @@ node_modules
 dist
 coverage
 src/generated
-.env
-.env.*
 !.env.example
 !.env.test.example
 *.log
 
 # Local helper for setting DATABASE_URL; not part of the app.
 set-db-url.ps1
+config.bat

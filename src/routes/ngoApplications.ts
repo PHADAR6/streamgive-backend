@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { prisma } from '../db.js';
 import { requireAdminSignature, sep53Hash } from '../middleware/adminAuth.js';
 import { notify } from '../notifications/service.js';
+import { sendContactVerification, verifyContactToken } from '../notifications/contactVerification.js';
 
 const APPLICATION_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
@@ -100,6 +101,8 @@ const statusQuerySchema = z.object({
   ownerAddress: z.string().regex(/^G[A-Z2-7]{55}$/),
 });
 
+const contactVerificationTokenSchema = z.object({ token: z.string().length(43) });
+
 /** Review body for approve/reject; optional `reviewNote` is at most 2000 characters. */
 const reviewBodySchema = z.object({
   reviewNote: z.string().max(2000).optional(),
@@ -148,6 +151,8 @@ async function createApplicationUnlessBlocked(data: z.infer<typeof applicationSc
   });
 }
 
+const adminSecurityScheme = [{ adminAddress: [], adminSignature: [], adminTimestamp: [] }];
+
 export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> {
   /**
    * Issues a short-lived challenge that must be signed by the NGO owner address.
@@ -155,7 +160,15 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
    * @body `{ ownerAddress }`
    * @returns 201 `{ challenge, message, expiresAt }`.
    */
-  app.post('/ngo-applications/challenge', async (request, reply) => {
+  app.post(
+    '/ngo-applications/challenge',
+    {
+      schema: {
+        tags: ['NGO Applications'],
+        summary: 'Issues a short-lived challenge that must be signed by the NGO owner address',
+      },
+    },
+    async (request, reply) => {
     const parsed = challengeRequestSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
@@ -194,6 +207,10 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
           max: Number(process.env.RATE_LIMIT_APPLICATION_MAX ?? 5),
           timeWindow: process.env.RATE_LIMIT_APPLICATION_WINDOW ?? '1 minute',
         },
+      },
+      schema: {
+        tags: ['NGO Applications'],
+        summary: 'Submits a public NGO verification application',
       },
     },
     async (request, reply) => {
@@ -248,7 +265,52 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
         ownerAddress: result.application.ownerAddress,
         name: result.application.name,
       });
+      await sendContactVerification(result.application);
       return reply.code(201).send(result.application);
+    },
+  );
+
+  /**
+   * Redeems the one-time link sent to an NGO application's contact email.
+   * @route GET /v1/ngo-applications/verify-contact-email
+   * @query token opaque, single-use token sent by email
+   * @returns 200 `{ verified: true }`; 400 invalid or expired token.
+   */
+  app.get('/ngo-applications/verify-contact-email', async (request, reply) => {
+    const parsed = contactVerificationTokenSchema.safeParse(request.query);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_or_expired_token' });
+    const verified = await verifyContactToken(parsed.data.token);
+    if (!verified) return reply.code(400).send({ error: 'invalid_or_expired_token' });
+    return { verified: true };
+  });
+
+  /**
+   * Sends another verification link without revealing whether the application exists.
+   * @route POST /v1/ngo-applications/:id/contact-email-verification
+   * @returns 202 `{ message }` for missing, verified, or resent applications.
+   */
+  app.post(
+    '/ngo-applications/:id/contact-email-verification',
+    {
+      config: {
+        rateLimit: {
+          max: Number(process.env.RATE_LIMIT_APPLICATION_MAX ?? 5),
+          timeWindow: process.env.RATE_LIMIT_APPLICATION_WINDOW ?? '1 minute',
+        },
+      },
+    },
+    async (request, reply) => {
+      const parsedParams = idParamSchema.safeParse(request.params);
+      if (parsedParams.success) {
+        const application = await prisma.ngoApplication.findUnique({
+          where: { id: parsedParams.data.id },
+          select: { id: true, name: true, contactEmail: true, emailVerifiedAt: true },
+        });
+        if (application && !application.emailVerifiedAt) {
+          await sendContactVerification(application);
+        }
+      }
+      return reply.code(202).send({ message: 'If eligible, a verification email has been sent.' });
     },
   );
 
@@ -269,7 +331,7 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
     '/ngo-applications/status',
     {
       schema: {
-        tags: ['NGOs'],
+        tags: ['NGO Applications'],
         summary: 'Check an NGO application status',
         description:
           'Returns the status and timestamps, plus the review note after review, for the supplied owner address.',
@@ -322,7 +384,17 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
    * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
    * @returns 200 `{ counts: { PENDING, APPROVED, REJECTED }, total }`.
    */
-  app.get('/ngo-applications/stats', { preHandler: requireAdminSignature }, async () => {
+  app.get(
+    '/ngo-applications/stats',
+    {
+      preHandler: requireAdminSignature,
+      schema: {
+        tags: ['NGO Applications'],
+        summary: 'Counts applications grouped by review status',
+        security: adminSecurityScheme,
+      },
+    },
+    async () => {
     const grouped = await prisma.ngoApplication.groupBy({
       by: ['status'],
       _count: { _all: true },
@@ -351,7 +423,17 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
    * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
    * @returns 200 `{ applications: Application[], total, limit, offset }`; 400 `{ error: "invalid_request", details }` (including `offset` above `MAX_APPLICATION_LIST_OFFSET`).
    */
-  app.get('/ngo-applications', { preHandler: requireAdminSignature }, async (request, reply) => {
+  app.get(
+    '/ngo-applications',
+    {
+      preHandler: requireAdminSignature,
+      schema: {
+        tags: ['NGO Applications'],
+        summary: 'Lists applications newest first with optional status and offset pagination',
+        security: adminSecurityScheme,
+      },
+    },
+    async (request, reply) => {
     const parsed = listQuerySchema.safeParse(request.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
@@ -381,7 +463,14 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
    */
   app.get(
     '/ngo-applications/:id',
-    { preHandler: requireAdminSignature },
+    {
+      preHandler: requireAdminSignature,
+      schema: {
+        tags: ['NGO Applications'],
+        summary: 'Returns a single application, including its submitted and review details',
+        security: adminSecurityScheme,
+      },
+    },
     async (request, reply) => {
       const parsedParams = idParamSchema.safeParse(request.params);
       if (!parsedParams.success) {
@@ -409,7 +498,14 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
    */
   app.post(
     '/ngo-applications/:id/approve',
-    { preHandler: requireAdminSignature },
+    {
+      preHandler: requireAdminSignature,
+      schema: {
+        tags: ['NGO Applications'],
+        summary: 'Approves a pending application and optionally records a review note',
+        security: adminSecurityScheme,
+      },
+    },
     async (request, reply) => {
       const reviewedBy = request.headers['x-admin-address'];
       if (typeof reviewedBy !== 'string') {
@@ -433,6 +529,9 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
       }
       if (application.status !== 'PENDING') {
         return reply.code(409).send({ error: 'already_reviewed' });
+      }
+      if (!application.emailVerifiedAt) {
+        return reply.code(409).send({ error: 'contact_email_unverified' });
       }
 
       try {
@@ -476,7 +575,14 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
    */
   app.post(
     '/ngo-applications/:id/reject',
-    { preHandler: requireAdminSignature },
+    {
+      preHandler: requireAdminSignature,
+      schema: {
+        tags: ['NGO Applications'],
+        summary: 'Rejects a pending application and optionally records a review note',
+        security: adminSecurityScheme,
+      },
+    },
     async (request, reply) => {
       const reviewedBy = request.headers['x-admin-address'];
       if (typeof reviewedBy !== 'string') {
@@ -500,6 +606,9 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
       }
       if (application.status !== 'PENDING') {
         return reply.code(409).send({ error: 'already_reviewed' });
+      }
+      if (!application.emailVerifiedAt) {
+        return reply.code(409).send({ error: 'contact_email_unverified' });
       }
 
       try {

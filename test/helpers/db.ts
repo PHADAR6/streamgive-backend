@@ -4,15 +4,24 @@ import { prisma } from '../../src/db.js';
 
 /** Truncates every table. Call between tests so fixtures never leak across them. */
 export async function resetDb(): Promise<void> {
-  await prisma.notificationLog.deleteMany();
-  await prisma.streamEvent.deleteMany();
-  await prisma.stream.deleteMany();
-  await prisma.donor.deleteMany();
-  await prisma.ngo.deleteMany();
-  await prisma.ngoApplication.deleteMany();
-  await prisma.ngoApplicationChallenge.deleteMany();
-  await prisma.indexerCheckpoint.deleteMany();
-  await prisma.indexerDeadLetter.deleteMany();
+  try {
+    await prisma.notificationEndpoint.deleteMany();
+    await prisma.notificationLog.deleteMany();
+    await prisma.streamEvent.deleteMany();
+    await prisma.stream.deleteMany();
+    await prisma.donor.deleteMany();
+    await prisma.ngo.deleteMany();
+    await prisma.ngoApplicationContactChallenge.deleteMany();
+    await prisma.ngoApplication.deleteMany();
+    await prisma.ngoApplicationChallenge.deleteMany();
+    await prisma.indexerCheckpoint.deleteMany();
+    await prisma.indexerDeadLetter.deleteMany();
+  } catch (err) {
+    const message =
+      `resetDb failed: ${String(err)}\n` +
+      'Ensure the test Postgres is running and DATABASE_URL in .env.test is correct.';
+    throw new Error(message, { cause: err });
+  }
 }
 
 /**
