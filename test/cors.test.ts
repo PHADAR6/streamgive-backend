@@ -82,7 +82,7 @@ describe('CORS configuration', () => {
 
     const response = await app.inject({
       method: 'OPTIONS',
-      url: '/v1/health',
+      url: '/metrics',
       headers: {
         origin: 'http://localhost:3001',
         'access-control-request-method': 'PATCH',

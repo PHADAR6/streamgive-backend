@@ -573,4 +573,32 @@ describe('startIndexer stop behavior', () => {
 
     expect(mocks.getLatestLedgerSequence.mock.calls.length).toBe(callsBeforeStop);
   });
+
+  it('recovers when the checkpoint is outside the RPC retention window', async () => {
+    process.env.DONATION_VAULT_CONTRACT_ID = mocks.contractId;
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    mocks.getCheckpointState.mockResolvedValue({
+      lastLedger: 500,
+      lastEventId: undefined,
+    });
+    mocks.getLatestLedgerSequence.mockResolvedValue(10000);
+    mocks.getEvents.mockRejectedValueOnce({
+      message: 'startLedger must be within the ledger range [9000, 10000]',
+    });
+    mocks.saveCheckpoint.mockResolvedValue(undefined);
+
+    const { pollOnce } = await freshIndexer();
+    const handler = vi.fn();
+    
+    await pollOnce(handler);
+
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining('checkpoint 500 has aged out'),
+    );
+    expect(mocks.saveCheckpoint).toHaveBeenCalledWith(10000);
+    expect(handler).not.toHaveBeenCalled();
+
+    vi.mocked(console.warn).mockRestore();
+  });
 });

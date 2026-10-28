@@ -4,8 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // fill the de-duplication set past its cap.
 const findFirst = vi.fn();
 const create = vi.fn();
+const upsert = vi.fn();
+const findMany = vi.fn();
 vi.mock('../../src/db.js', () => ({
-  prisma: { notificationLog: { findFirst, create } },
+  prisma: {
+    notificationLog: { findFirst, create, upsert },
+    notificationEndpoint: { findMany },
+  },
 }));
 
 const {
@@ -32,6 +37,8 @@ describe('notify de-duplication cap', () => {
     _resetDeliveredEventIdsForTest();
     findFirst.mockReset().mockResolvedValue(null);
     create.mockReset().mockResolvedValue({});
+    upsert.mockReset().mockResolvedValue({});
+    findMany.mockReset().mockResolvedValue([]); // no table endpoints: env fallback
     process.env.NOTIFY_WEBHOOK_URL = 'http://example.com/webhook';
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});

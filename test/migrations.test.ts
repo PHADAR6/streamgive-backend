@@ -19,6 +19,7 @@ const EXPECTED_TABLES: [string, string[]][] = [
   ['ngo_applications',     ['id', 'owner_address', 'name', 'description', 'website', 'contact_email', 'country', 'status', 'review_note', 'created_at', 'updated_at']],
   ['ngo_application_challenges', ['challenge', 'owner_address', 'expires_at']],
   ['notification_logs',    ['id', 'event_id', 'event_type', 'channel', 'success', 'error', 'created_at']],
+  ['notification_endpoints', ['id', 'url', 'secret', 'event_types', 'enabled', 'created_at', 'updated_at']],
   ['indexer_checkpoints',  ['id', 'last_ledger', 'last_event_id', 'updated_at']],
   ['indexer_dead_letters', ['id', 'event_id', 'ledger', 'contract_id', 'error', 'topic', 'value', 'tx_hash', 'attempts', 'resolved_at', 'created_at', 'updated_at']],
   ['stream_events',        ['id', 'type', 'stream_id', 'ledger', 'tx_hash', 'payload', 'created_at']],
