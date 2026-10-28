@@ -637,6 +637,68 @@ describe('GET /v1/streams/:id', () => {
   });
 });
 
+describe('GET /v1/streams/chain/:onChainId', () => {
+  afterEach(async () => {
+    await resetDb();
+  });
+
+  it('returns a single stream by its on-chain ID', async () => {
+    const app = buildServer();
+
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
+    const ngo = await prisma.ngo.create({
+      data: {
+        ownerAddress: fakeAddress('B'),
+        name: 'NGO',
+        displayName: 'Public NGO Name',
+        verified: true,
+      },
+    });
+    const stream = await prisma.stream.create({
+      data: {
+        onChainId: 42n,
+        donorId: donor.id,
+        ngoId: ngo.id,
+        tokenAddress: fakeAddress('D'),
+        rate: '1',
+        balance: '100',
+        withdrawn: '0',
+      },
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/v1/streams/chain/42' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: stream.id,
+      onChainId: '42',
+      donor: { address: donor.address },
+      ngo: { id: ngo.id, name: 'Public NGO Name', registered: true },
+    });
+
+    await app.close();
+  });
+
+  it('404s for an on-chain ID that does not exist', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({ method: 'GET', url: '/v1/streams/chain/987654321' });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ error: 'not_found' });
+
+    await app.close();
+  });
+
+  it('400s for a non-numeric on-chain ID', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({ method: 'GET', url: '/v1/streams/chain/not-a-number' });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: 'invalid_request' });
+
+    await app.close();
+  });
+});
+
 describe('GET /v1/streams/:id/activity', () => {
   afterEach(async () => {
     await resetDb();
