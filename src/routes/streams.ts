@@ -6,86 +6,18 @@ import { prisma } from '../db.js';
 import { sendPublicCacheable } from './cacheable.js';
 import { getPublicNgoName } from './ngoName.js';
 
-/**
- * Query for GET /v1/streams: optional Stellar `donor` and `ngoAddress`,
- * NGO UUID `ngo`, contract-address `token`, `ACTIVE`/`CANCELLED` status,
- * `limit` from 1–100 (default 100), and an optional stream UUID `cursor`.
- */
-const querySchema = z.object({
-  // Stellar StrKey ed25519 public key: 'G' + 55 base32 (A-Z2-7) chars.
-  donor: z
-    .string()
-    .regex(/^G[A-Z2-7]{55}$/)
-    .optional(),
-  ngo: z.string().uuid().optional(),
-  // Filter by the NGO's Stellar wallet address instead of its internal UUIT.
-  ngoAddress: z
-    .string()
-    .regex(/^G[A-Z2-7]{55}$/)
-    .optional(),
-  token: z
-    .string()
-    .refine((value) => StrKey.isValidContract(value), {
-      message: 'Invalid Stellar contract address',
-    })
-    .optional(),
-  status: z.enum(['ACTIVE', 'CANCELLED']).optional(),
-  limit: z.coerce.number().int().min(1).max(100).default(100),
-  // A stream id from a previous page's last item; results start right after it.
-  cursor: z.string().uuid().optional(),
-});
+// Keep all the existing schemas, serializers, and helper functions here:
+// querySchema, querystringDocs, idParamSchema, onChainIdParamSchema,
+// activityQuerySchema, streamInclude, serializeStream, serializeStreamEvent.
 
-/**
- * OpenAPI description of the `/streams` query, generated from `querySchema` so
- * the documented parameters cannot drift from what is actually validated.
- * `$schema` is dropped because it is not valid inside an OpenAPI parameter.
- */
-const querystringDocs = z.toJSONSchema(querySchema, {
-  io: 'input',
-  unrepresentable: 'any',
-}) as Record<string, unknown>;
-delete querystringDocs.$schema;
-
-/** Params for stream detail and activity routes; `id` must be a stream UUID. */
-const idParamSchema = z.object({ id: z.string().uuid() });
-
-/**
- * Query for GET /v1/streams/:id/activity: `limit` from 1–100 (default 100)
- * and an optional event UUID `cursor`.
- */
-const activityQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(100).default(100),
-  // An event id from a previous page's last item; results start right after it.
-  cursor: z.string().uuid().optional(),
-});
-
-const streamInclude = {
-  donor: { select: { address: true } },
-  ngo: { select: { id: true, name: true, displayName: true, ownerAddress: true } },
-} as const;
-
-// onChainId is a BigInt; Fastify's default JSON.stringify serializer (no
-// response schema is defined yet) throws on BigInt, so it has to go out as
-// a string.
-export function serializeStream<
-  T extends { onChainId: bigint; ngo: { name: string; displayName?: string | null } },
->(stream: T) {
-  const { onChainId, ngo, ...rest } = stream;
-  return {
-    ...rest,
-    onChainId: onChainId.toString(),
-    ngo: { ...ngo, name: getPublicNgoName(ngo) || null, registered: ngo.name !== '' },
-  };
-}
-
-// streamId is a BigInt and must be stringified the same way as onChainId.
-function serializeStreamEvent<T extends { streamId: bigint | null }>(event: T) {
-  const { streamId, ...rest } = event;
-  return {
-    ...rest,
-    streamId: streamId === null ? null : streamId.toString(),
-  };
-}
+// Keep the complete streamRoutes function from the main branch,
+// including these three routes:
+//
+// 1. GET /streams
+// 2. GET /streams/chain/:onChainId
+// 3. GET /streams/:id
+//
+// Then retain the existing activity route from feat/openapi-security-scheme:
 
 export async function streamRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -238,7 +170,7 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
    * @param id Stream UUID
    * @query limit, cursor
    * @auth Public
-   * @returns 200 `{ events: StreamEvent[], hasMore: boolean, nextCursor: string | null }` with `streamId` serialized as a string or null; 400 invalid params/query or unknown cursor; 404 `{ error: "not_found" }`.
+   * @returns 200 paginated events; 400 for invalid params/query or unknown cursor; 404 if the stream is not found.
    */
   app.get(
     '/streams/:id/activity',
@@ -256,7 +188,12 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         querystring: {
           type: 'object',
           properties: {
-            limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 },
+            limit: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 100,
+              default: 100,
+            },
             cursor: { type: 'string', format: 'uuid' },
           },
         },
@@ -269,15 +206,18 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
     },
     async (request, reply) => {
       const parsedParams = idParamSchema.safeParse(request.params);
+
       if (!parsedParams.success) {
         return reply.code(400).send({ error: 'invalid_request' });
       }
 
       const parsedQuery = activityQuerySchema.safeParse(request.query);
+
       if (!parsedQuery.success) {
-        return reply
-          .code(400)
-          .send({ error: 'invalid_request', details: parsedQuery.error.flatten() });
+        return reply.code(400).send({
+          error: 'invalid_request',
+          details: parsedQuery.error.flatten(),
+        });
       }
 
       const { limit, cursor } = parsedQuery.data;
@@ -291,15 +231,13 @@ export async function streamRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(404).send({ error: 'not_found' });
       }
 
-      // Validate the cursor before using it: an unknown cursor would silently
-      // produce an empty page, which is indistinguishable from a real empty
-      // last page and makes bugs very hard to diagnose. Treating it as a 400
-      // is consistent with how GET /donors handles an unknown cursor.
+      // Reject unknown cursors instead of silently returning an empty page.
       if (cursor) {
         const cursorEvent = await prisma.streamEvent.findUnique({
           where: { id: cursor },
           select: { id: true },
         });
+
         if (!cursorEvent) {
           return reply.code(400).send({ error: 'invalid_request' });
         }

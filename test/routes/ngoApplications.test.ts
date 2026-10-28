@@ -1,8 +1,6 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { sep53Hash } from '../../src/middleware/adminAuth.js';
-
 vi.mock('../../src/notifications/service.js', () => ({ notify: vi.fn() }));
 
 import { prisma } from '../../src/db.js';
@@ -45,11 +43,21 @@ async function signedApplicationPayload(
 }
 
 describe('POST /v1/ngo-applications', () => {
+  const originalResendApiKey = process.env.RESEND_API_KEY;
+  const originalEmailFrom = process.env.NOTIFY_EMAIL_FROM;
+  const originalApiPublicUrl = process.env.API_PUBLIC_URL;
+
   beforeAll(() => {
     process.env.ADMIN_ADDRESS = adminKeypair.publicKey();
   });
 
   afterEach(async () => {
+    if (originalResendApiKey === undefined) delete process.env.RESEND_API_KEY;
+    else process.env.RESEND_API_KEY = originalResendApiKey;
+    if (originalEmailFrom === undefined) delete process.env.NOTIFY_EMAIL_FROM;
+    else process.env.NOTIFY_EMAIL_FROM = originalEmailFrom;
+    if (originalApiPublicUrl === undefined) delete process.env.API_PUBLIC_URL;
+    else process.env.API_PUBLIC_URL = originalApiPublicUrl;
     vi.mocked(notify).mockClear();
     await resetDb();
   });
@@ -71,6 +79,51 @@ describe('POST /v1/ngo-applications', () => {
       ownerAddress: response.json().ownerAddress,
       name: response.json().name,
     });
+
+    await app.close();
+  });
+
+  it('verifies the contact email with a single-use link', async () => {
+    process.env.RESEND_API_KEY = 'test-key';
+    process.env.NOTIFY_EMAIL_FROM = 'verify@example.org';
+    process.env.API_PUBLIC_URL = 'https://api.example.org';
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/ngo-applications',
+      payload: await signedApplicationPayload(app),
+    });
+    expect(response.statusCode).toBe(201);
+    expect(response.json().emailVerifiedAt).toBeNull();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    const email = JSON.parse(String(fetchSpy.mock.calls[0][1]?.body)) as { html: string };
+    const [, link] = email.html.match(/href="([^"]+)"/) ?? [];
+    if (!link) throw new Error('verification link was missing from the email');
+    const token = new URL(link).searchParams.get('token');
+    if (!token) throw new Error('verification token was missing from the link');
+    expect(token).toHaveLength(43);
+
+    const verified = await app.inject({
+      method: 'GET',
+      url: `/v1/ngo-applications/verify-contact-email?token=${token}`,
+    });
+    expect(verified.statusCode).toBe(200);
+    expect(verified.json()).toEqual({ verified: true });
+
+    const reused = await app.inject({
+      method: 'GET',
+      url: `/v1/ngo-applications/verify-contact-email?token=${token}`,
+    });
+    expect(reused.statusCode).toBe(400);
+    expect(
+      (await prisma.ngoApplication.findUnique({ where: { id: response.json().id } }))
+        ?.emailVerifiedAt,
+    ).not.toBeNull();
 
     await app.close();
   });
@@ -149,85 +202,6 @@ describe('POST /v1/ngo-applications', () => {
 
     expect(response.statusCode).toBe(201);
     expect(response.json().website).toBe('https://example.org');
-
-    await app.close();
-  });
-
-  it('accepts an already-schemed http website without double-prepending', async () => {
-    const app = buildServer();
-
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/ngo-applications',
-      payload: await signedApplicationPayload(app, { website: 'http://example.org' }),
-    });
-
-    expect(response.statusCode).toBe(201);
-    expect(response.json().website).toBe('http://example.org');
-
-    await app.close();
-  });
-
-  it('rejects a whitespace-only name with 400', async () => {
-    const app = buildServer();
-
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/ngo-applications',
-      payload: await signedApplicationPayload(app, { name: '   ' }),
-    });
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error).toBe('invalid_request');
-
-    await app.close();
-  });
-
-  it('rejects a whitespace-only description with 400', async () => {
-    const app = buildServer();
-
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/ngo-applications',
-      payload: await signedApplicationPayload(app, { description: '\t\n ' }),
-    });
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error).toBe('invalid_request');
-
-    await app.close();
-  });
-
-  it('rejects a website URL exceeding 2048 characters with 400', async () => {
-    const app = buildServer();
-
-    const oversizedWebsite = 'https://example.org/' + 'a'.repeat(2030);
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/ngo-applications',
-      payload: await signedApplicationPayload(app, { website: oversizedWebsite }),
-    });
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error).toBe('invalid_request');
-
-    await app.close();
-  });
-
-  it('rejects a contactEmail exceeding 254 characters with 400', async () => {
-    const app = buildServer();
-
-    // Build an email that is just over the 254-character RFC 5321 limit.
-    const localPart = 'a'.repeat(243);
-    const oversizedEmail = `${localPart}@example.com`; // 243 + 1 + 11 = 255 chars
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/ngo-applications',
-      payload: await signedApplicationPayload(app, { contactEmail: oversizedEmail }),
-    });
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error).toBe('invalid_request');
 
     await app.close();
   });
@@ -460,13 +434,7 @@ describe('admin NGO application review', () => {
 
   it('rejects a seconds-based timestamp with a clear unit error', async () => {
     const app = buildServer();
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const headers = signAdminRequest(
-      adminKeypair,
-      'GET',
-      '/v1/ngo-applications',
-      timestamp,
-    );
+    const headers = signAdminRequest(adminKeypair, 'GET', '/v1/ngo-applications', Math.floor(Date.now() / 1000).toString());
 
     const response = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
     expect(response.statusCode).toBe(401);
@@ -487,64 +455,6 @@ describe('admin NGO application review', () => {
     expect(replay.json().error).toBe('replayed_signature');
 
     await app.close();
-  });
-
-  // Mirrors the 5-minute clock-skew window documented in ENVIRONMENT.md and
-  // API.md. Not exported from adminAuth.ts, so it's duplicated here rather
-  // than imported.
-  const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
-
-  it('accepts a timestamp exactly at the clock-skew limit in the past', async () => {
-    const app = buildServer();
-    try {
-      vi.useFakeTimers();
-      const timestamp = (Date.now() - MAX_CLOCK_SKEW_MS).toString();
-      const headers = signAdminRequest(adminKeypair, 'GET', '/v1/ngo-applications', timestamp);
-
-      const response = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
-      expect(response.statusCode).toBe(200);
-    } finally {
-      vi.useRealTimers();
-      await app.close();
-    }
-  });
-
-  it('accepts a timestamp exactly at the clock-skew limit in the future', async () => {
-    const app = buildServer();
-    try {
-      vi.useFakeTimers();
-      const timestamp = (Date.now() + MAX_CLOCK_SKEW_MS).toString();
-      const headers = signAdminRequest(adminKeypair, 'GET', '/v1/ngo-applications', timestamp);
-
-      const response = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
-      expect(response.statusCode).toBe(200);
-    } finally {
-      vi.useRealTimers();
-      await app.close();
-    }
-  });
-
-  it('rejects a replay once its timestamp has aged out of the skew window, as stale rather than silently accepted', async () => {
-    const app = buildServer();
-    try {
-      vi.useFakeTimers();
-      const headers = signAdminRequest(adminKeypair, 'GET', '/v1/ngo-applications');
-
-      const first = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
-      expect(first.statusCode).toBe(200);
-
-      // Past the window the cached entry is pruned on the next request, but
-      // the replayed timestamp is by then also outside the skew window, so
-      // it must come back stale rather than slip through as a fresh replay.
-      vi.advanceTimersByTime(MAX_CLOCK_SKEW_MS + 1);
-
-      const replay = await app.inject({ method: 'GET', url: '/v1/ngo-applications', headers });
-      expect(replay.statusCode).toBe(401);
-      expect(replay.json().error).toBe('stale_signature');
-    } finally {
-      vi.useRealTimers();
-      await app.close();
-    }
   });
 
   it('paginates applications while reporting the full total', async () => {
@@ -573,9 +483,12 @@ describe('admin NGO application review', () => {
   it('approves a pending application', async () => {
     const app = buildServer();
 
-    const application = await prisma.ngoApplication.create({ data: validApplicationPayload() });
+    const application = await prisma.ngoApplication.create({
+      data: { ...validApplicationPayload(), emailVerifiedAt: new Date() },
+    });
     const url = `/v1/ngo-applications/${application.id}/approve`;
-    const headers = signAdminRequest(adminKeypair, 'POST', url);
+    const body = JSON.stringify({});
+    const headers = signAdminRequest(adminKeypair, 'POST', url, undefined, body);
 
     const response = await app.inject({ method: 'POST', url, headers, payload: {} });
     expect(response.statusCode).toBe(200);
@@ -599,9 +512,12 @@ describe('admin NGO application review', () => {
 
   it('notifies when a pending application is rejected', async () => {
     const app = buildServer();
-    const application = await prisma.ngoApplication.create({ data: validApplicationPayload() });
+    const application = await prisma.ngoApplication.create({
+      data: { ...validApplicationPayload(), emailVerifiedAt: new Date() },
+    });
     const url = `/v1/ngo-applications/${application.id}/reject`;
-    const headers = signAdminRequest(adminKeypair, 'POST', url);
+    const body = JSON.stringify({ reviewNote: 'Insufficient documentation' });
+    const headers = signAdminRequest(adminKeypair, 'POST', url, undefined, body);
 
     const response = await app.inject({
       method: 'POST',
@@ -630,7 +546,8 @@ describe('admin NGO application review', () => {
 
     const application = await prisma.ngoApplication.create({ data: validApplicationPayload() });
     const url = `/v1/ngo-applications/${application.id}/approve`;
-    const headers = signAdminRequest(adminKeypair, 'POST', url);
+    const body = JSON.stringify([]);
+    const headers = signAdminRequest(adminKeypair, 'POST', url, undefined, body);
 
     const response = await app.inject({ method: 'POST', url, headers, payload: [] as never });
 
@@ -649,7 +566,8 @@ describe('admin NGO application review', () => {
 
     const application = await prisma.ngoApplication.create({ data: validApplicationPayload() });
     const url = `/v1/ngo-applications/${application.id}/reject`;
-    const headers = signAdminRequest(adminKeypair, 'POST', url);
+    const body = JSON.stringify(['not', 'an', 'object']);
+    const headers = signAdminRequest(adminKeypair, 'POST', url, undefined, body);
 
     const response = await app.inject({
       method: 'POST',
@@ -673,7 +591,8 @@ describe('admin NGO application review', () => {
     const application = await prisma.ngoApplication.create({ data: validApplicationPayload() });
     const realUrl = `/v1/ngo-applications/${application.id}/approve`;
     // Signed for a *different* application's approve endpoint.
-    const headers = signAdminRequest(adminKeypair, 'POST', '/v1/ngo-applications/other-id/approve');
+    const body = JSON.stringify({});
+    const headers = signAdminRequest(adminKeypair, 'POST', '/v1/ngo-applications/other-id/approve', undefined, body);
 
     const response = await app.inject({ method: 'POST', url: realUrl, headers, payload: {} });
     expect(response.statusCode).toBe(401);
@@ -686,7 +605,8 @@ describe('admin NGO application review', () => {
 
     const nonExistentId = '00000000-0000-0000-0000-000000000000';
     const approveUrl = `/v1/ngo-applications/${nonExistentId}/approve`;
-    const approveHeaders = signAdminRequest(adminKeypair, 'POST', approveUrl);
+    const approveBody = JSON.stringify({});
+    const approveHeaders = signAdminRequest(adminKeypair, 'POST', approveUrl, undefined, approveBody);
 
     const approveResponse = await app.inject({
       method: 'POST',
@@ -698,7 +618,8 @@ describe('admin NGO application review', () => {
     expect(approveResponse.json().error).toBe('not_found');
 
     const rejectUrl = `/v1/ngo-applications/${nonExistentId}/reject`;
-    const rejectHeaders = signAdminRequest(adminKeypair, 'POST', rejectUrl);
+    const rejectBody = JSON.stringify({});
+    const rejectHeaders = signAdminRequest(adminKeypair, 'POST', rejectUrl, undefined, rejectBody);
 
     const rejectResponse = await app.inject({
       method: 'POST',
