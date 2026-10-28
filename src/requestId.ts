@@ -10,11 +10,9 @@ export const requestIdOptions = {
   genReqId: () => randomUUID(),
 } satisfies Pick<FastifyServerOptions, 'requestIdHeader' | 'genReqId'>;
 
-// Visible ASCII and space/tab only: a control character or newline in the
-// echoed header would make Node throw ERR_INVALID_CHAR, turning a malformed
-// caller header into a 500 (and newline injection into a header-splitting
-// risk if that validation ever regressed).
-const VALID_REQUEST_ID = /^[\x20-\x7E]+$/;
+// Keep caller-provided ids small and log-safe. Restricting characters also
+// prevents control-character injection in response headers and log records.
+const VALID_REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/;
 
 function safeRequestId(id: string): string {
   return VALID_REQUEST_ID.test(id) ? id : randomUUID();
