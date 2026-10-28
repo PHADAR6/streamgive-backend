@@ -3,7 +3,11 @@ import { createHmac } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { prisma } from '../../src/db.js';
-import { _resetDeliveredEventIdsForTest, notify } from '../../src/notifications/service.js';
+import {
+  _resetDeliveredEventIdsForTest,
+  notify,
+  processPendingWebhookDeliveries,
+} from '../../src/notifications/service.js';
 import type { NotificationEvent } from '../../src/notifications/types.js';
 import { resetDb } from '../helpers/db.js';
 
@@ -179,6 +183,42 @@ describe('notify', () => {
     );
   });
 
+  it('fans an event out only to enabled endpoints subscribed to its type', async () => {
+    await prisma.notificationEndpoint.createMany({
+      data: [
+        {
+          url: 'https://one.example/webhook',
+          secret: 'one-secret',
+          eventTypes: ['stream_created'],
+        },
+        {
+          url: 'https://two.example/webhook',
+          secret: 'two-secret',
+          eventTypes: ['ngo_approved'],
+        },
+        {
+          url: 'https://disabled.example/webhook',
+          secret: 'unused-secret',
+          eventTypes: ['stream_created'],
+          enabled: false,
+        },
+      ],
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(okResponse());
+
+    await notify({ ...event, eventId: 'fanout-event-1' });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      'https://one.example/webhook',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ ...event, eventId: 'fanout-event-1' }) }),
+    );
+    const log = await prisma.notificationLog.findFirst({
+      where: { eventId: 'fanout-event-1', channel: { startsWith: 'webhook:' }, success: true },
+    });
+    expect(log).not.toBeNull();
+  });
+
   it('picks up a rotated NOTIFY_WEBHOOK_URL on the next call', async () => {
     process.env.NOTIFY_WEBHOOK_URL = 'http://example.com/first';
 
@@ -280,6 +320,62 @@ describe('notify', () => {
     });
   });
 
+  describe('persisted webhook retry outbox', () => {
+    async function makeDeliveryDue(eventId: string): Promise<void> {
+      await prisma.webhookDelivery.update({
+        where: { eventId },
+        data: { nextAttemptAt: new Date(0) },
+      });
+    }
+
+    it('retries a receiver that fails twice and then succeeds', async () => {
+      process.env.NOTIFY_WEBHOOK_URL = 'http://example.com/webhook';
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(new Response(null, { status: 500 }))
+        .mockResolvedValueOnce(new Response(null, { status: 503 }))
+        .mockResolvedValueOnce(new Response(null, { status: 200 }));
+      const retryEvent = { ...event, eventId: 'event-outbox-retry' };
+
+      await notify(retryEvent);
+      await makeDeliveryDue(retryEvent.eventId);
+      await processPendingWebhookDeliveries();
+      await makeDeliveryDue(retryEvent.eventId);
+      await processPendingWebhookDeliveries();
+
+      const delivery = await prisma.webhookDelivery.findUnique({
+        where: { eventId: retryEvent.eventId },
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(3);
+      expect(delivery).toMatchObject({ attempts: 3, status: 'DELIVERED', lastError: null });
+    });
+
+    it('marks a delivery failed after the maximum number of attempts', async () => {
+      process.env.NOTIFY_WEBHOOK_URL = 'http://example.com/webhook';
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(new Response(null, { status: 500 }));
+      const retryEvent = { ...event, eventId: 'event-outbox-give-up' };
+
+      await notify(retryEvent);
+      for (let attempt = 1; attempt < 5; attempt += 1) {
+        await makeDeliveryDue(retryEvent.eventId);
+        await processPendingWebhookDeliveries();
+      }
+
+      const delivery = await prisma.webhookDelivery.findUnique({
+        where: { eventId: retryEvent.eventId },
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(5);
+      expect(delivery).toMatchObject({ attempts: 5, status: 'FAILED' });
+
+      await processPendingWebhookDeliveries();
+      expect(fetchSpy).toHaveBeenCalledTimes(5);
+    });
+  });
+
   describe('webhook signature', () => {
     const event: NotificationEvent = {
       type: 'stream_created',
@@ -297,7 +393,7 @@ describe('notify', () => {
       return fetchSpy;
     }
 
-    it('signs the body with an HMAC-SHA256 of NOTIFY_WEBHOOK_SECRET', async () => {
+    it('signs the timestamp, delivery ID, and body with a versioned HMAC-SHA256', async () => {
       process.env.NOTIFY_WEBHOOK_URL = 'http://example.com/webhook';
       process.env.NOTIFY_WEBHOOK_SECRET = 'a-shared-secret';
 
@@ -314,8 +410,16 @@ describe('notify', () => {
       // than compared against a hard-coded digest — that way the assertion
       // stays true if the payload shape changes, and still fails if the
       // service ever signs something other than what it transmits.
-      const expected = createHmac('sha256', 'a-shared-secret').update(body).digest('hex');
+      const timestamp = headers['x-streamgive-timestamp'];
+      const deliveryId = headers['x-streamgive-delivery'];
+      const expected = `v1=${createHmac('sha256', 'a-shared-secret')
+        .update(`${timestamp}.${deliveryId}.${body}`)
+        .digest('hex')}`;
 
+      expect(timestamp).toMatch(/^\d+$/);
+      expect(deliveryId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
       expect(headers['x-streamgive-signature']).toBe(expected);
     });
 
@@ -333,9 +437,14 @@ describe('notify', () => {
 
       // A receiver only ever has the raw body — this is that verification,
       // done the way the README tells integrators to do it.
-      const verified = createHmac('sha256', 'a-shared-secret')
-        .update(Buffer.from(init.body as string, 'utf8'))
-        .digest('hex');
+      const verified = `v1=${createHmac('sha256', 'a-shared-secret')
+        .update(
+          `${headers['x-streamgive-timestamp']}.${headers['x-streamgive-delivery']}.${Buffer.from(
+            init.body as string,
+            'utf8',
+          ).toString('utf8')}`,
+        )
+        .digest('hex')}`;
 
       expect(signature).toBe(verified);
       expect(JSON.parse(init.body as string)).toEqual(event);
@@ -353,7 +462,11 @@ describe('notify', () => {
       const headers = init.headers as Record<string, string>;
 
       const forged = JSON.stringify({ ...event, ngoId: 'ATTACKER-NGO' });
-      const forgedDigest = createHmac('sha256', 'a-shared-secret').update(forged).digest('hex');
+      const forgedDigest = `v1=${createHmac('sha256', 'a-shared-secret')
+        .update(
+          `${headers['x-streamgive-timestamp']}.${headers['x-streamgive-delivery']}.${forged}`,
+        )
+        .digest('hex')}`;
 
       expect(forgedDigest).not.toBe(headers['x-streamgive-signature']);
     });
@@ -370,6 +483,10 @@ describe('notify', () => {
 
       expect(headers['x-streamgive-signature']).toBeUndefined();
       expect(headers['content-type']).toBe('application/json');
+      expect(headers['x-streamgive-timestamp']).toMatch(/^\d+$/);
+      expect(headers['x-streamgive-delivery']).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
     });
   });
 });
