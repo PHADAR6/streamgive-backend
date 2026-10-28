@@ -343,9 +343,9 @@ describe('rate limit 429 responses', () => {
 
     const app = buildServer();
 
-    const first = await app.inject({ method: 'GET', url: '/health' });
-    const second = await app.inject({ method: 'GET', url: '/health' });
-    const third = await app.inject({ method: 'GET', url: '/health' });
+    const first = await app.inject({ method: 'GET', url: '/v1/ngos' });
+    const second = await app.inject({ method: 'GET', url: '/v1/ngos' });
+    const third = await app.inject({ method: 'GET', url: '/v1/ngos' });
 
     expect(first.statusCode).not.toBe(429);
     expect(second.statusCode).not.toBe(429);
@@ -365,8 +365,8 @@ describe('rate limit 429 responses', () => {
 
     const app = buildServer();
 
-    const first = await app.inject({ method: 'GET', url: '/health' });
-    const second = await app.inject({ method: 'GET', url: '/health' });
+    const first = await app.inject({ method: 'GET', url: '/v1/ngos' });
+    const second = await app.inject({ method: 'GET', url: '/v1/ngos' });
 
     expect(first.statusCode).not.toBe(429);
     expect(first.headers['x-ratelimit-limit']).toBe('1');

@@ -97,4 +97,30 @@ describe('GET /v1/indexer/status (#59, #256)', () => {
 
     await app.close();
   });
+
+  it('recognizes legacy CONTRACT_IDS alias', async () => {
+    delete process.env.WATCHED_CONTRACT_IDS;
+    delete process.env.NGO_REGISTRY_CONTRACT_ID;
+    delete process.env.DONATION_VAULT_CONTRACT_ID;
+    process.env.CONTRACT_IDS = 'C_LEGACYCONTRACT123';
+
+    await saveCheckpoint(123450);
+    vi.spyOn(rpc, 'getLatestLedgerSequence').mockResolvedValue(123455);
+
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/indexer/status',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.configured).toBe(true);
+    expect(body.checkpointLedger).toBe(123450);
+    expect(body.latestLedger).toBe(123455);
+    expect(body.ledgerLag).toBe(5);
+
+    await app.close();
+  });
 });

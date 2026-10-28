@@ -41,7 +41,7 @@ describe('request id correlation', () => {
     );
   });
 
-  it('handles a very long x-request-id value', async () => {
+  it('replaces an x-request-id longer than 128 characters', async () => {
     const app = buildTestServer();
     apps.push(app);
 
@@ -52,9 +52,23 @@ describe('request id correlation', () => {
       headers: { 'x-request-id': longId },
     });
 
-    // Currently passes through; validation could truncate or reject
-    expect(response.headers['x-request-id']).toBe(longId);
     expect(response.statusCode).toBe(200);
+    expect(response.headers['x-request-id']).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it('accepts safe punctuation in x-request-id values', async () => {
+    const app = buildTestServer();
+    apps.push(app);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/test',
+      headers: { 'x-request-id': 'client.request_id-123' },
+    });
+
+    expect(response.headers['x-request-id']).toBe('client.request_id-123');
   });
 
   it('replaces x-request-id values containing control characters', async () => {

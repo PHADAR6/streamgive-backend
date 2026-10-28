@@ -1,14 +1,15 @@
 # Notification events
 
-When `NOTIFY_WEBHOOK_URL` is set, the backend POSTs a JSON body to that URL for
-each notification it emits. Every body is discriminated by its `type` field.
-The matching TypeScript definitions live in
+The backend POSTs a JSON body to each configured webhook destination for every
+notification it emits (see [Webhook destinations](#webhook-destinations)).
+Every body is discriminated by its `type` field. The matching TypeScript definitions live in
 [`src/notifications/types.ts`](../src/notifications/types.ts).
 
 All events may include an optional `eventId` — the on-chain event id used to
 deduplicate deliveries and to retry failed sends. Deliveries are signed with
-the `x-streamgive-signature` header as described in the "Notification events"
-section of the [README](../README.md#notification-events).
+the `x-streamgive-signature` header, keyed with the destination's secret, as
+described in the "Notification events" section of the
+[README](../README.md#notification-events).
 
 ## `ngo_registered`
 
@@ -130,3 +131,25 @@ Emitted when an admin approves or rejects an NGO application.
 
 - `status` — either `APPROVED` or `REJECTED`.
 - `reviewNote` — optional admin review note.
+
+## Webhook destinations
+
+`notification_endpoints` stores one destination per row: `url`, `secret`,
+`event_types`, and `enabled`. Event types use the names in
+`src/notifications/types.ts` (for example `stream_created` and
+`application_submitted`). A notification is sent only to enabled endpoints
+whose event list contains its type. Destinations are called concurrently.
+
+Every delivery is recorded in `notification_logs`. Configured endpoints use a
+channel value of `webhook:<endpoint-id>`, so a success or failure can be
+inspected independently for each destination. On retry, a destination that
+already recorded success for an event is skipped while failed destinations
+are attempted again. Logs do not include endpoint secrets or URL paths.
+
+The existing `NOTIFY_WEBHOOK_URL` and `NOTIFY_WEBHOOK_SECRET` variables remain
+available for migration: they are used as a single all-events destination
+only while there are no enabled rows in the table. Once an endpoint is
+enabled, table subscriptions take precedence.
+
+Endpoint configuration is operational data. Restrict database access to
+trusted operators and use HTTPS URLs for destinations.
